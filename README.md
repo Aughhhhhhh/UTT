@@ -57,6 +57,7 @@ thumbprint of a trusted code-signing certificate before running either script.
 
 - duckyinnit — everything
 - itsclaudeya — model viewer
+<sub>hi its me itscloudya</sub>
 
 ## License
 
