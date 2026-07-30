@@ -1,5 +1,5 @@
 """
-PSG Texture (tx) Parser Library for Skate 2/3
+PSG Texture (tx) Parser Library for Skate 2/3 :3
 --------------------------------------------
 A simple, yet advanced library to parse, modify, and export .psg texture files.
 Handles dynamic DXT format detection and alpha channel manipulation.
