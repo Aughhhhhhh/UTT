@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+build/
+dist/
+cache/
+exports/
+*.spec
+*.log
+build_log*.txt
+plan.txt
+
+assets/*
+!assets/README.md
