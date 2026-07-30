@@ -12,6 +12,3 @@ exports/
 *.log
 build_log*.txt
 plan.txt
-
-assets/*
-!assets/README.md

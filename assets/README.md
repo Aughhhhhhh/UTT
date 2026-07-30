@@ -1,8 +1,8 @@
 # Runtime assets
 
-The source repository does not license or redistribute the external utilities
-used for archive and texture conversion. Place the required files in this
-layout before running those features or creating a distribution build:
+These files are the runtime utilities used for archive and texture conversion.
+Keep this layout intact when running from source or creating a distribution
+build:
 
 ```text
 assets/
@@ -18,5 +18,6 @@ assets/
       temp.psg
 ```
 
-The prebuilt installer includes the runtime files needed by the application.
-See `THIRD_PARTY_NOTICES.md` for attribution and licensing boundaries.
+The files in this folder are not covered by UTT's MIT license. See
+`THIRD_PARTY_NOTICES.md` and `assets/licenses` for attribution and licensing
+boundaries.

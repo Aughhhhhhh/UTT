@@ -31,9 +31,9 @@ python -m pip install -r requirements.txt
 python main.py
 ```
 
-Archive and texture conversion features also require the runtime utilities
-listed in [assets/README.md](assets/README.md). Those external utilities are
-not covered by UTT's MIT license.
+Archive and texture conversion features use the runtime utilities included in
+the [assets](assets) folder. Those external utilities are not covered by UTT's
+MIT license.
 
 ## Build
 
