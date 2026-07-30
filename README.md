@@ -37,21 +37,48 @@ MIT license.
 
 ## Build
 
+Install the build dependencies:
+
+```powershell
+python -m pip install -r requirements-build.txt
+```
+
 Build the portable executable:
 
 ```powershell
-build.bat
+.\build.bat
 ```
 
-Build the executable and installer with Inno Setup 7:
+Install [Inno Setup](https://jrsoftware.org/isdl.php), then build the executable
+and installer:
 
 ```powershell
-$env:INNO_ISCC = "C:\Program Files\Inno Setup 7\ISCC.exe"
-build_installer.bat
+.\build_installer.bat
 ```
+
+The script detects normal Inno Setup 6 and 7 installations. If it is installed
+somewhere else, set `INNO_ISCC` to the full path of `ISCC.exe`. The finished
+installer is placed in `build/installer` and selected in File Explorer.
 
 To Authenticode-sign distribution builds, set `UTT_SIGN_CERT_SHA1` to the
 thumbprint of a trusted code-signing certificate before running either script.
+
+## Publish a release
+
+Collaborators with write access can publish installers without the GitHub CLI:
+
+1. Update `AppVersion` in `installer.iss` and the matching version fields in
+   `version_info.txt`.
+2. Commit and push the source changes. GitHub Desktop can do this without a
+   separate Git installation.
+3. Run `build_installer.bat`.
+4. Open the repository's **Releases** page and choose **Draft a new release**.
+5. Create a tag matching the version, such as `v1.1.2`, and attach
+   `build/installer/UTT-Setup-1.1.2.exe`.
+6. Set a release title, add notes, and choose **Publish release**.
+
+Use a new version and tag for normal changes. Only replace an existing release
+asset when correcting the build for that exact version.
 
 ## Credits
 
