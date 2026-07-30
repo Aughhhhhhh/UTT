@@ -35,6 +35,7 @@ class Mesh:
     vertices: np.ndarray
     faces: np.ndarray
     uvs: np.ndarray | None = None
+    normals: np.ndarray | None = None
     material_name: str | None = None
     vertex_stride: int = 0
     attributes: tuple[VertexAttribute, ...] = ()

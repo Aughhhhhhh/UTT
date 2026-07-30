@@ -206,12 +206,15 @@ def parse_psg(
             warnings.append(f"Mesh {mesh_index}: {exc}; mesh skipped")
             continue
 
+        normals = _compute_vertex_normals(vertices, faces)
+
         meshes.append(
             Mesh(
                 name=_name_for_mesh(mesh_names, mesh_index, paired_count),
                 vertices=vertices,
                 faces=faces,
                 uvs=uvs,
+                normals=normals,
                 material_name=_material_for_mesh(
                     diffuse_names, mesh_index, paired_count
                 ),
@@ -659,6 +662,26 @@ def _slice(data: bytes, offset: int, size: int, label: str) -> bytes:
 def _read_cstring(data: bytes, offset: int) -> str:
     value, _ = _read_cstring_with_end(data, offset)
     return value
+
+
+def _compute_vertex_normals(vertices: np.ndarray, faces: np.ndarray) -> np.ndarray | None:
+    if len(faces) == 0:
+        return None
+    normals = np.zeros_like(vertices)
+    face_positions = vertices[faces]
+    face_normals = np.cross(
+        face_positions[:, 1] - face_positions[:, 0],
+        face_positions[:, 2] - face_positions[:, 0],
+    )
+    lengths = np.linalg.norm(face_normals, axis=1)
+    valid = lengths > 1e-12
+    face_normals[valid] /= lengths[valid, None]
+    for i in range(3):
+        np.add.at(normals, faces[:, i], face_normals)
+    vertex_lengths = np.linalg.norm(normals, axis=1)
+    valid_vertices = vertex_lengths > 1e-12
+    normals[valid_vertices] /= vertex_lengths[valid_vertices, None]
+    return normals
 
 
 def _read_cstring_with_end(data: bytes, offset: int) -> tuple[str, int]:

@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
 )
 
 from archive_manager import ArchiveManager
+from gltf_exporter import export_gltf
 from model_viewer import ModelPreview
 from psg_converter import PSGConverter
 from PSGTx import PSGTx
@@ -391,6 +392,7 @@ class MainWindow(QMainWindow):
         model_page_layout.setContentsMargins(0, 0, 0, 0)
         self.model_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.model_preview = ModelPreview()
+        self.model_preview.export_requested.connect(self._export_model)
         self.model_splitter.addWidget(self.model_tree)
         self.model_splitter.addWidget(self.model_preview)
         self.model_splitter.setStretchFactor(0, 0)
@@ -866,6 +868,22 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, APP_TITLE, f"Exported:\n{path}")
         except Exception as exc:
             self._show_error(str(exc))
+
+    def _export_model(self, model, source_path):
+        if model is None:
+            return
+        default_name = source_path.stem if source_path else "model"
+        default = self.output_dir / f"{default_name}.glb"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export model as glTF Binary", str(default),
+            "glTF Binary (*.glb);;All files (*.*)",
+        )
+        if not path:
+            return
+        self._start_worker(
+            lambda: export_gltf(model, path),
+            lambda result: QMessageBox.information(self, APP_TITLE, f"Model exported:\n{result}"),
+        )
 
     def _choose_image(self):
         path, _ = QFileDialog.getOpenFileName(

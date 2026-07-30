@@ -6,7 +6,7 @@ import numpy as np
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -17,14 +17,66 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from mdl_parser import PSGModel
+from mdl_parser import Mesh, PSGModel
 
 
-MAX_VIEWPORT_TRIANGLES = 30_000
-INTERACTION_TRIANGLES = 500
+MAX_VIEWPORT_TRIANGLES = 200_000
+INTERACTION_TRIANGLES = 3_000
+SUBDIVISION_TRIANGLE_LIMIT = 50_000
+
+
+def _subdivide_mesh(mesh: Mesh) -> Mesh:
+    if mesh.normals is None or mesh.triangle_count == 0 or mesh.triangle_count > SUBDIVISION_TRIANGLE_LIMIT:
+        return mesh
+    verts = mesh.vertices
+    norms = mesh.normals
+    faces = mesh.faces
+    uvs = mesh.uvs
+    edge_map: dict[tuple[int, int], int] = {}
+    new_verts = list(verts)
+    new_norms = list(norms)
+    new_uvs = list(uvs) if uvs is not None else None
+
+    def midpoint(i: int, j: int) -> int:
+        key = (i, j) if i < j else (j, i)
+        idx = edge_map.get(key)
+        if idx is not None:
+            return idx
+        idx = len(new_verts)
+        new_verts.append((verts[i] + verts[j]) * 0.5)
+        avg = norms[i] + norms[j]
+        new_norms.append(avg / np.linalg.norm(avg))
+        if new_uvs is not None:
+            new_uvs.append((uvs[i] + uvs[j]) * 0.5)
+        edge_map[key] = idx
+        return idx
+
+    new_faces = []
+    for a, b, c in faces:
+        ab = midpoint(a, b)
+        bc = midpoint(b, c)
+        ca = midpoint(c, a)
+        new_faces.append((a, ab, ca))
+        new_faces.append((b, bc, ab))
+        new_faces.append((c, ca, bc))
+        new_faces.append((ab, bc, ca))
+
+    return Mesh(
+        name=mesh.name,
+        vertices=np.asarray(new_verts, dtype=np.float32),
+        faces=np.asarray(new_faces, dtype=np.uint32),
+        uvs=np.asarray(new_uvs, dtype=np.float32) if new_uvs is not None else None,
+        normals=np.asarray(new_norms, dtype=np.float32),
+        material_name=mesh.material_name,
+        vertex_stride=mesh.vertex_stride,
+        attributes=mesh.attributes,
+        source_offsets=mesh.source_offsets,
+    )
 
 
 class ModelPreview(QWidget):
+    export_requested = pyqtSignal(object, object)  # (PSGModel, Path)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.model: PSGModel | None = None
@@ -75,6 +127,14 @@ class ModelPreview(QWidget):
         self.status_label = QLabel("Click and drag to rotate  •  Mouse wheel to zoom")
         self.status_label.setObjectName("modelDetails")
         layout.addWidget(self.status_label)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        self.export_btn = QPushButton("Export as glTF…")
+        self.export_btn.setEnabled(False)
+        self.export_btn.clicked.connect(self._on_export)
+        button_row.addWidget(self.export_btn)
+        layout.addLayout(button_row)
         self._draw_empty("Select a PSG model from the list")
 
     def show_loading(self, path: Path) -> None:
@@ -83,10 +143,14 @@ class ModelPreview(QWidget):
         self.title_label.setText(path.name)
         self.details_label.setText("Parsing model…")
         self.warnings_button.setEnabled(False)
+        self.export_btn.setEnabled(False)
         self._draw_empty("Loading…")
 
     def set_model(self, path: Path, model: PSGModel) -> None:
         self.path = path
+        original_count = model.triangle_count
+        self._subdivide_meshes(model)
+        subdivided_count = model.triangle_count
         self.model = model
         self.title_label.setText(path.name)
         self.details_label.setText(
@@ -95,18 +159,29 @@ class ModelPreview(QWidget):
         )
         self.warnings_button.setText(f"Warnings ({len(model.warnings)})")
         self.warnings_button.setEnabled(bool(model.warnings))
+        self.export_btn.setEnabled(True)
         self.redraw_model(reset_camera=True)
 
         shown = min(model.triangle_count, MAX_VIEWPORT_TRIANGLES)
+        parts = []
+        if original_count != subdivided_count:
+            parts.append(f"subdivided to {model.triangle_count:,}")
         if shown < model.triangle_count:
-            self.status_label.setText(
-                f"Previewing {shown:,} of {model.triangle_count:,} triangles  •  "
-                "Click and drag to rotate  •  Mouse wheel to zoom"
-            )
-        else:
-            self.status_label.setText(
-                "Click and drag to rotate  •  Mouse wheel to zoom"
-            )
+            parts.append(f"showing {shown:,}")
+        label = "  •  ".join(parts)
+        base = "Click and drag to rotate  •  Mouse wheel to zoom"
+        self.status_label.setText(
+            f"{label}  •  {base}" if label else base
+        )
+
+    @staticmethod
+    def _subdivide_meshes(model: PSGModel) -> None:
+        for i in range(len(model.meshes)):
+            model.meshes[i] = _subdivide_mesh(model.meshes[i])
+
+    def _on_export(self) -> None:
+        if self.model is not None:
+            self.export_requested.emit(self.model, self.path)
 
     def show_warnings(self) -> None:
         if self.model is None or not self.model.warnings:
@@ -172,9 +247,16 @@ class ModelPreview(QWidget):
             remaining_budget = max(0, remaining_budget - allocation)
             remaining_triangles = max(0, remaining_triangles - mesh.triangle_count)
 
+            sampled_faces = self._sample_faces(mesh.faces, allocation)
+            face_normals = (
+                mesh.normals[sampled_faces]
+                if mesh.normals is not None
+                else None
+            )
             artist = self._make_collection(
-                vertices[self._sample_faces(mesh.faces, allocation)],
+                vertices[sampled_faces],
                 mesh_index,
+                normals=face_normals,
             )
             self.axes.add_collection3d(artist)
             self._full_artists.append(artist)
@@ -192,11 +274,18 @@ class ModelPreview(QWidget):
                     0,
                     interaction_remaining_triangles - mesh.triangle_count,
                 )
+                interaction_sampled = self._sample_faces(
+                    mesh.faces, interaction_allocation
+                )
+                interaction_normals = (
+                    mesh.normals[interaction_sampled]
+                    if mesh.normals is not None
+                    else None
+                )
                 interaction_artist = self._make_collection(
-                    vertices[
-                        self._sample_faces(mesh.faces, interaction_allocation)
-                    ],
+                    vertices[interaction_sampled],
                     mesh_index,
+                    normals=interaction_normals,
                 )
                 interaction_artist.set_visible(False)
                 self.axes.add_collection3d(interaction_artist)
@@ -212,7 +301,8 @@ class ModelPreview(QWidget):
         self.canvas.draw_idle()
 
     def _make_collection(
-        self, triangles: np.ndarray, mesh_index: int
+        self, triangles: np.ndarray, mesh_index: int,
+        normals: np.ndarray | None = None,
     ) -> Poly3DCollection:
         if self.wireframe.isChecked():
             return Poly3DCollection(
@@ -224,16 +314,25 @@ class ModelPreview(QWidget):
                 zsort="average",
             )
 
-        edge_a = triangles[:, 1] - triangles[:, 0]
-        edge_b = triangles[:, 2] - triangles[:, 0]
-        normals = np.cross(edge_a, edge_b)
-        lengths = np.linalg.norm(normals, axis=1)
-        valid = lengths > 1e-12
-        normals[valid] /= lengths[valid, None]
-
         light = np.array((0.35, -0.45, 0.82), dtype=np.float32)
         light /= np.linalg.norm(light)
-        intensity = np.clip(0.25 + 0.68 * np.abs(normals @ light), 0.22, 0.93)
+
+        if normals is not None:
+            vert_intensity = np.clip(
+                0.25 + 0.68 * np.abs(normals @ light), 0.22, 0.93
+            )
+            intensity = vert_intensity.mean(axis=1)
+        else:
+            edge_a = triangles[:, 1] - triangles[:, 0]
+            edge_b = triangles[:, 2] - triangles[:, 0]
+            face_normals = np.cross(edge_a, edge_b)
+            lengths = np.linalg.norm(face_normals, axis=1)
+            valid = lengths > 1e-12
+            face_normals[valid] /= lengths[valid, None]
+            intensity = np.clip(
+                0.25 + 0.68 * np.abs(face_normals @ light), 0.22, 0.93
+            )
+
         intensity = np.clip(
             intensity + ((mesh_index % 3) - 1) * 0.035, 0.18, 0.96
         )
