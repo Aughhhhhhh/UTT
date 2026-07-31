@@ -146,6 +146,15 @@ class ModelPreview(QWidget):
         self.export_btn.setEnabled(False)
         self._draw_empty("Loading…")
 
+    def clear(self, message: str = "No model loaded") -> None:
+        self.model = None
+        self.path = None
+        self.title_label.setText("Select a model to preview")
+        self.details_label.setText("")
+        self.warnings_button.setEnabled(False)
+        self.export_btn.setEnabled(False)
+        self._draw_empty(message)
+
     def set_model(self, path: Path, model: PSGModel) -> None:
         self.path = path
         original_count = model.triangle_count

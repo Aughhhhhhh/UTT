@@ -27,7 +27,7 @@ only after an archive is selected.
 UTT requires Python 3.11 or newer.
 
 ```powershell
-python -m pip install -r requirements.txt
+python -m pip install -r "Tool Requirements.txt" -r "Get Current Models and Textures requirements.txt"
 python main.py
 ```
 

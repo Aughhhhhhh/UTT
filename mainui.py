@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -13,10 +14,12 @@ from PyQt6.QtCore import QEvent, QObject, QRegularExpression, Qt, QThread, pyqtS
 from PyQt6.QtGui import QPixmap, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMessageBox, QProgressDialog, QPushButton, QSizePolicy,
-    QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton,
+    QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
+
+import recipe
 
 from archive_manager import ArchiveManager
 from gltf_exporter import export_gltf
@@ -285,6 +288,10 @@ class MainWindow(QMainWindow):
         self._workers: list[Worker] = []
         self.unpack_progress: QProgressDialog | None = None
         self.repack_progress: QProgressDialog | None = None
+        self._rpcs3 = None
+        self._character_items: list = []
+        self._character_model_hex = ""
+        self._character_texture: PSGTx | None = None
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(
@@ -311,6 +318,7 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setExpanding(True)
         self.tabs.addTab(self._make_browser_tab(), "Browse")
         self.tabs.addTab(self._make_convert_tab(), "Convert")
+        self.tabs.addTab(self._make_character_tab(), "Character")
         shell_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(shell)
 
@@ -348,11 +356,19 @@ class MainWindow(QMainWindow):
         self.texture_tree = QTreeWidget()
         self.texture_tree.setHeaderLabels(["Texture category / hex ID"])
         self.texture_tree.itemSelectionChanged.connect(self._on_texture_selected)
+        self.texture_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.texture_tree.customContextMenuRequested.connect(
+            lambda pos: self._show_cache_menu(self.texture_tree, pos)
+        )
 
         self.model_tree = QTreeWidget()
         self.model_tree.setHeaderLabels(["Model folder / PSG file"])
         self.model_tree.setMinimumWidth(300)
         self.model_tree.itemSelectionChanged.connect(self._on_texture_selected)
+        self.model_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.model_tree.customContextMenuRequested.connect(
+            lambda pos: self._show_cache_menu(self.model_tree, pos)
+        )
 
         self.preview_container = QWidget()
         self.preview_container.setObjectName("detailsPanel")
@@ -407,8 +423,8 @@ class MainWindow(QMainWindow):
     def _make_convert_tab(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(32, 28, 32, 32)
-        layout.setSpacing(18)
+        layout.setContentsMargins(32, 24, 32, 24)
+        layout.setSpacing(14)
 
         heading = QLabel("Image to PSG")
         heading.setObjectName("convertTitle")
@@ -421,33 +437,30 @@ class MainWindow(QMainWindow):
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(description)
 
-        card = QFrame()
-        card.setObjectName("card")
-        card.setMaximumWidth(980)
-        card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(22, 22, 22, 22)
-        card_layout.setSpacing(16)
-
         self.image_drop_zone = ImageDropZone()
         self.image_drop_zone.setObjectName("imageDropZone")
         self.image_drop_zone.clicked.connect(self._choose_image)
         self.image_drop_zone.imageDropped.connect(self._set_input_image)
-        card_layout.addWidget(self.image_drop_zone, 1)
+        layout.addWidget(self.image_drop_zone, 1)
 
-        self.image_path_label = QLabel("No image selected")
-        self.image_path_label.setObjectName("selectedImagePath")
-        self.image_path_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.image_path_label.setWordWrap(True)
-        card_layout.addWidget(self.image_path_label)
+        controls = QFrame()
+        controls.setObjectName("card")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(20, 16, 20, 16)
+        controls_layout.setSpacing(14)
 
+        file_row = QHBoxLayout()
+        file_row.setSpacing(14)
         image_btn = QPushButton("Select image")
         image_btn.clicked.connect(self._choose_image)
-        card_layout.addWidget(image_btn, 0, Qt.AlignmentFlag.AlignCenter)
-
-        fields = QHBoxLayout()
-        fields.setSpacing(18)
+        file_row.addWidget(image_btn)
+        self.image_path_label = QLabel("No image selected")
+        self.image_path_label.setObjectName("selectedImagePath")
+        self.image_path_label.setWordWrap(True)
+        file_row.addWidget(self.image_path_label, 1)
 
         alias_column = QVBoxLayout()
+        alias_column.setSpacing(4)
         alias_column.addWidget(QLabel("18-character hex name"))
         self.alias_input = QLineEdit()
         self.alias_input.setObjectName("aliasInput")
@@ -458,9 +471,10 @@ class MainWindow(QMainWindow):
         ))
         self.alias_input.textChanged.connect(self._update_convert_ready)
         alias_column.addWidget(self.alias_input)
-        fields.addLayout(alias_column, 1)
+        file_row.addLayout(alias_column)
 
         resolution_column = QVBoxLayout()
+        resolution_column.setSpacing(4)
         resolution_column.addWidget(QLabel("Resolution"))
         self.resolution = QSpinBox()
         self.resolution.setRange(128, 4096)
@@ -483,38 +497,119 @@ class MainWindow(QMainWindow):
         self.resolution_up.clicked.connect(self._increase_resolution)
         resolution_row.addWidget(self.resolution_up)
         resolution_column.addLayout(resolution_row)
-        fields.addLayout(resolution_column)
-        card_layout.addLayout(fields)
+        file_row.addLayout(resolution_column)
+        controls_layout.addLayout(file_row)
 
-        opacity_header = QHBoxLayout()
-        opacity_header.addWidget(QLabel("Opacity"))
-        opacity_header.addStretch(1)
-        self.convert_opacity_text = QLabel("100%")
-        self.convert_opacity_text.setObjectName("convertDescription")
-        opacity_header.addWidget(self.convert_opacity_text)
-        card_layout.addLayout(opacity_header)
-
+        opacity_row = QHBoxLayout()
+        opacity_row.setSpacing(12)
+        opacity_row.addWidget(QLabel("Opacity"))
         self.convert_opacity = QSlider(Qt.Orientation.Horizontal)
         self.convert_opacity.setRange(0, 100)
         self.convert_opacity.setValue(100)
         self.convert_opacity.valueChanged.connect(
             lambda value: self.convert_opacity_text.setText(f"{value}%")
         )
-        card_layout.addWidget(self.convert_opacity)
+        opacity_row.addWidget(self.convert_opacity, 1)
+        self.convert_opacity_text = QLabel("100%")
+        self.convert_opacity_text.setObjectName("convertDescription")
+        opacity_row.addWidget(self.convert_opacity_text)
+        controls_layout.addLayout(opacity_row)
 
-        output_hint = QLabel(f"Output: {self.output_dir}")
-        output_hint.setObjectName("convertDescription")
-        output_hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        output_hint.setWordWrap(True)
-        card_layout.addWidget(output_hint)
+        output_row = QHBoxLayout()
+        output_row.setSpacing(12)
+        output_row.addWidget(QLabel("Output folder"))
+        self.convert_output_input = QLineEdit(str(self.output_dir))
+        self.convert_output_input.setToolTip("PSG files will be saved into this folder. Defaults to the exports folder.")
+        output_row.addWidget(self.convert_output_input, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._choose_output_folder)
+        output_row.addWidget(browse_btn)
+        controls_layout.addLayout(output_row)
 
         self.convert_button = QPushButton("Convert image to PSG")
         self.convert_button.setObjectName("convertButton")
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self._convert_image)
-        card_layout.addWidget(self.convert_button)
-        layout.addWidget(card, 1, Qt.AlignmentFlag.AlignHCenter)
+        controls_layout.addWidget(self.convert_button)
+        layout.addWidget(controls)
 
+        return page
+
+    def _make_character_tab(self) -> QWidget:
+        """Live Skate 3 character items: read the recipe from RPCS3 memory and
+        preview the worn models/textures from the local cache."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.setSpacing(8)
+        self.rpcs3_status = QLabel("RPCS3 not attached")
+        self.rpcs3_status.setObjectName("status")
+        header.addWidget(self.rpcs3_status, 1)
+        attach_btn = QPushButton("Attach to RPCS3")
+        attach_btn.clicked.connect(self._attach_rpcs3)
+        header.addWidget(attach_btn)
+        self.character_scan_button = QPushButton("Scan for Models and Textures")
+        self.character_scan_button.clicked.connect(self._scan_character)
+        header.addWidget(self.character_scan_button)
+        self.character_open_button = QPushButton("Open Output Folder")
+        self.character_open_button.setEnabled(False)
+        self.character_open_button.clicked.connect(self._open_character_output)
+        header.addWidget(self.character_open_button)
+        layout.addLayout(header)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        self.character_tree = QTreeWidget()
+        self.character_tree.setHeaderLabels(["Character part / texture"])
+        self.character_tree.setMinimumWidth(340)
+        self.character_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.character_tree.customContextMenuRequested.connect(
+            lambda pos: self._show_cache_menu(self.character_tree, pos)
+        )
+        self.character_tree.itemSelectionChanged.connect(self._on_character_item_selected)
+        splitter.addWidget(self.character_tree)
+
+        self.character_stack = QStackedWidget()
+
+        self.character_model_preview = ModelPreview()
+        self.character_model_preview.export_requested.connect(self._export_model)
+        self.character_stack.addWidget(self.character_model_preview)
+
+        self.character_texture_page = QWidget()
+        self.character_texture_page.setObjectName("detailsPanel")
+        texture_layout = QVBoxLayout(self.character_texture_page)
+        texture_layout.setContentsMargins(20, 20, 20, 20)
+        texture_layout.setSpacing(12)
+        texture_top = QHBoxLayout()
+        back_btn = QPushButton("View 3D model")
+        back_btn.clicked.connect(self._show_character_model)
+        texture_top.addWidget(back_btn)
+        texture_top.addStretch(1)
+        texture_layout.addLayout(texture_top)
+        self.character_texture_label = QLabel("Select a texture to preview")
+        self.character_texture_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.character_texture_label.setMinimumSize(430, 380)
+        self.character_texture_label.setObjectName("preview")
+        texture_layout.addWidget(self.character_texture_label, 1)
+        self.character_force_opaque = QCheckBox("Force visible pixels to 255 opacity")
+        self.character_force_opaque.setToolTip("Off preserves the alpha stored in the PSG. On applies PSGTx's alpha cleanup.")
+        self.character_force_opaque.toggled.connect(self._refresh_character_texture_preview)
+        texture_layout.addWidget(self.character_force_opaque)
+        self.character_selected_label = QLabel("No texture selected")
+        texture_layout.addWidget(self.character_selected_label)
+        self.character_stack.addWidget(self.character_texture_page)
+
+        splitter.addWidget(self.character_stack)
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        splitter.setSizes([360, 880])
+        layout.addWidget(splitter, 1)
+
+        placeholder = QTreeWidgetItem(["Scan the character to list worn items"])
+        placeholder.setData(0, Qt.ItemDataRole.UserRole, None)
+        self.character_tree.addTopLevelItem(placeholder)
         return page
 
     def _apply_style(self):
@@ -529,8 +624,9 @@ class MainWindow(QMainWindow):
             QPushButton#titleWindowButton:hover { background: #3c4043; }
             QPushButton#titleCloseButton:hover { background: #c42b1c; }
             QTabWidget::pane { border: 0; border-top: 1px solid #3c4043; }
-            QTabBar::tab { background: #303134; padding: 13px 22px; margin: 0; border: 0; }
-            QTabBar::tab:selected { background: #4d5156; border-bottom: 3px solid #8ab4f8; }
+            QTabBar::tab { background: #303134; color: #c7ccd4; padding: 9px 26px; margin: 7px 5px; border: 1px solid #4a4d52; border-radius: 18px; }
+            QTabBar::tab:hover { background: #3c4043; color: #ffffff; }
+            QTabBar::tab:selected { background: #5b86e5; color: #ffffff; border: 1px solid #5b86e5; }
             QPushButton { background: #5b86e5; border: 0; border-radius: 16px; padding: 9px 16px; font-weight: 600; }
             QPushButton:hover { background: #7299ec; }
             QPushButton:disabled { background: #45474b; color: #9aa0a6; }
@@ -885,6 +981,230 @@ class MainWindow(QMainWindow):
             lambda result: QMessageBox.information(self, APP_TITLE, f"Model exported:\n{result}"),
         )
 
+    def _find_psg(self, hex_name) -> Path | None:
+        key = str(hex_name).lower()
+        candidates = (key, key[2:]) if key.startswith("0x") else ("0x" + key, key)
+        for candidate in candidates:
+            matches = self.psg_index.get(candidate)
+            if matches:
+                return matches[0]
+        return None
+
+    def _character_item_cached(self, item: dict) -> bool:
+        model = item.get("model")
+        if model and self._find_psg(model):
+            return True
+        return any(self._find_psg(hex_name) for hex_name in item.get("textures", {}).values())
+
+    def _attach_rpcs3(self):
+        try:
+            self._rpcs3 = recipe.find_rpcs3()
+        except recipe.RPCS3NotFoundError as exc:
+            self.rpcs3_status.setText("RPCS3 not attached")
+            self._show_error(str(exc))
+            return
+        self.rpcs3_status.setText(
+            f"Attached to RPCS3 — process {self._rpcs3.process_id}"
+        )
+
+    def _scan_character(self):
+        self.character_scan_button.setEnabled(False)
+        self.rpcs3_status.setText("Scanning character…")
+        self._start_worker(
+            lambda: recipe.scan_and_save(recipe.get_base_path() / "output"),
+            self._character_scan_finished,
+            self._character_scan_failed,
+        )
+
+    def _character_scan_finished(self, result):
+        self._character_items = result["items"]
+        self._character_output_folder = result["output_folder"]
+        self.character_tree.clear()
+        for item in self._character_items:
+            part = QTreeWidgetItem([item["name"]])
+            part.setData(0, Qt.ItemDataRole.UserRole, ("part", item))
+            if not self._character_item_cached(item):
+                part.setText(0, f"{item['name']}  (not in cache)")
+            model_hex = item.get("model")
+            if model_hex:
+                path = self._find_psg(model_hex)
+                if path is not None:
+                    model = QTreeWidgetItem([f"model {model_hex}"])
+                    model.setData(0, Qt.ItemDataRole.UserRole, ("model", model_hex, str(path)))
+                else:
+                    model = QTreeWidgetItem([f"model {model_hex} — not found"])
+                    model.setData(0, Qt.ItemDataRole.UserRole, ("model", model_hex, None))
+            else:
+                model = QTreeWidgetItem(["model not found"])
+                model.setData(0, Qt.ItemDataRole.UserRole, ("model", None, None))
+            part.addChild(model)
+            texture_hex = item.get("textures", {}).get("diffuse")
+            if texture_hex:
+                path = self._find_psg(texture_hex)
+                if path is not None:
+                    texture = QTreeWidgetItem([f"texture {texture_hex}"])
+                    texture.setData(0, Qt.ItemDataRole.UserRole, ("texture", texture_hex, str(path)))
+                else:
+                    texture = QTreeWidgetItem([f"texture {texture_hex} — not found"])
+                    texture.setData(0, Qt.ItemDataRole.UserRole, ("texture", texture_hex, None))
+            else:
+                texture = QTreeWidgetItem(["texture not found"])
+                texture.setData(0, Qt.ItemDataRole.UserRole, ("texture", None, None))
+            part.addChild(texture)
+            self.character_tree.addTopLevelItem(part)
+        self.character_tree.expandAll()
+        self.character_scan_button.setEnabled(True)
+        self.character_open_button.setEnabled(True)
+        self.rpcs3_status.setText(
+            f"Found {len(self._character_items)} items — saved to {result['txt_path']}"
+        )
+        if self.character_tree.topLevelItemCount():
+            first = self.character_tree.topLevelItem(0)
+            self.character_tree.setCurrentItem(first.child(0) if first.childCount() else first)
+
+    def _character_scan_failed(self, details: str):
+        self.character_scan_button.setEnabled(True)
+        self.rpcs3_status.setText("Scan failed")
+        self._show_error(details)
+
+    def _on_character_item_selected(self):
+        selected = self.character_tree.selectedItems()
+        if not selected:
+            return
+        node = selected[0]
+        data = node.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        kind = data[0]
+        if kind == "part":
+            return
+        if kind == "texture":
+            hex_name, path = data[1], data[2]
+            if path is None:
+                self._character_texture = None
+                self.character_texture_label.setPixmap(QPixmap())
+                self.character_texture_label.setText(
+                    "Texture not found in cache — unpack createacharacter.big to preview."
+                )
+                self.character_selected_label.setText(hex_name or "")
+                return
+            self.character_texture_label.setText("Loading preview…")
+            self._start_worker(
+                lambda: (hex_name, PSGTx(str(path))),
+                self._character_texture_loaded,
+            )
+            return
+        model_hex, path = data[1], data[2]
+        self._character_texture = None
+        self.character_texture_label.setPixmap(QPixmap())
+        self.character_texture_label.setText("Select a texture to preview")
+        self.character_selected_label.setText("No texture selected")
+        if path is None:
+            self._character_model_hex = ""
+            self.character_model_preview.clear(
+                "Model not found in cache — unpack createacharacter.big to preview."
+            )
+            return
+        self._character_model_hex = model_hex
+        model_path = Path(path)
+        self._show_character_model()
+        self.character_model_preview.show_loading(model_path)
+        self._start_worker(
+            lambda: (model_hex, model_path, self.model_loader(model_path)),
+            self._character_model_loaded,
+        )
+
+    def _character_model_loaded(self, result):
+        hex_name, path, model = result
+        if hex_name == self._character_model_hex:
+            self.character_model_preview.set_model(path, model)
+
+    def _show_character_model(self):
+        self.character_stack.setCurrentWidget(self.character_model_preview)
+
+    def _character_texture_loaded(self, result):
+        hex_name, texture = result
+        selected = self.character_tree.selectedItems()
+        if not selected:
+            return
+        node = selected[0]
+        data = node.data(0, Qt.ItemDataRole.UserRole)
+        if not data or data[0] != "texture" or data[1] != hex_name:
+            return
+        self._character_texture = texture
+        self.character_selected_label.setText(hex_name)
+        self._refresh_character_texture_preview()
+        self.character_stack.setCurrentWidget(self.character_texture_page)
+
+    def _refresh_character_texture_preview(self):
+        if self._character_texture is None:
+            return
+        image = self._character_texture.get_tx_image(
+            self.character_force_opaque.isChecked()
+        )
+        pixmap = QPixmap.fromImage(ImageQt(image.convert("RGBA")))
+        self.character_texture_label.setPixmap(pixmap.scaled(
+            self.character_texture_label.size(),
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
+    def _open_character_output(self):
+        folder = recipe.get_base_path() / "output"
+        if not folder.is_dir():
+            return
+        if sys.platform == "win32":
+            os.startfile(str(folder))
+        else:
+            subprocess.Popen(["xdg-open", str(folder)])
+
+    def _show_cache_menu(self, tree, pos):
+        """Right-click menu that reveals a cached PSG file in Explorer."""
+        node = tree.itemAt(pos)
+        if node is None:
+            return
+        data = node.data(0, Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        file_path = None
+        if isinstance(data, str):
+            matches = self.psg_index.get(data, [])
+            if matches:
+                file_path = matches[0]
+        else:
+            kind = data[0]
+            if kind == "part":
+                return
+            if kind == "psg_model":
+                file_path = Path(data[1])
+            elif kind == "model" and data[2]:
+                file_path = Path(data[2])
+            elif kind == "texture" and data[2]:
+                file_path = Path(data[2])
+        if file_path is None or not Path(file_path).is_file():
+            QMessageBox.information(
+                self, APP_TITLE, "No cached PSG file for this item."
+            )
+            return
+        menu = QMenu(self)
+        action = menu.addAction("Search in Explorer")
+        if menu.exec(tree.viewport().mapToGlobal(pos)) is action:
+            self._open_in_explorer(file_path)
+
+    def _open_in_explorer(self, path: Path):
+        path = Path(path).resolve()
+        if sys.platform == "win32":
+            subprocess.Popen(f'explorer /select,"{path}"')
+        else:
+            subprocess.Popen(["xdg-open", str(path.parent)])
+
+    def _choose_output_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Choose output folder", self.convert_output_input.text().strip()
+        )
+        if folder:
+            self.convert_output_input.setText(os.path.normpath(folder))
+
     def _choose_image(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Choose an image", "",
@@ -926,7 +1246,7 @@ class MainWindow(QMainWindow):
     def _convert_image(self):
         source = self.input_image_path
         alias = self.alias_input.text().strip().lower()
-        folder = str(self.output_dir)
+        folder = self.convert_output_input.text().strip() or str(self.output_dir)
         if not source:
             self._show_error("Choose an input image.")
             return
@@ -1001,7 +1321,8 @@ class MainWindow(QMainWindow):
             "UTT Credits",
             "Credits\n\n"
             "duckyinnit — everything\n"
-            "itsclaudeya — model viewer",
+            "itsclaudeya — model viewer\n"
+            "Salix — Get Current Models And Textures",
         )
 
     def _toggle_maximized(self):
@@ -1022,3 +1343,4 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if self.current_texture is not None:
             self._preview_loaded(self.current_texture)
+        self._refresh_character_texture_preview()

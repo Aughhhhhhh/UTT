@@ -11,11 +11,20 @@ if not exist "%ASSETS_SRC%" (
   exit /b 1
 )
 
+python -c "import pymem, S3RecipeHandler" >nul 2>&1
+if errorlevel 1 (
+  echo Missing build dependencies. Install them first:
+  echo   python -m pip install -r requirements-build.txt
+  exit /b 1
+)
+
 python -m PyInstaller --noconfirm --clean --onefile --noupx --windowed --name UTT --icon "%CD%\UTT.ico" ^
   --version-file "%CD%\version_info.txt" ^
   --distpath "%CD%\build" ^
   --workpath "%CD%\build\_pyinstaller" ^
   --specpath "%CD%\build\_pyinstaller" ^
+  --hidden-import pymem ^
+  --hidden-import S3RecipeHandler ^
   --add-data "%CD%\psg_list.json;." ^
   --add-data "%CD%\UTT.ico;." ^
   main.py
