@@ -84,6 +84,7 @@ asset when correcting the build for that exact version.
 
 - duckyinnit — everything
 - itsclaudeya — model viewer
+- Salix — Get Current Models And Textures
 <sub>hi its me itscloudya</sub>
 
 ## License
