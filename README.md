@@ -6,16 +6,20 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
 ## Features
 
 - Unpack `createacharacter.big` into a local cache.
-- Browse and export PSG textures.
+- Browse and export PSG textures (PS3) and RX2 textures (Xbox 360).
 - Browse character models directly from
   `cache/data/content/createacharacter/model/cas_db`.
 - Preview PSG models with an interactive 3D viewer.
 - Convert images to PSG textures with resolution and opacity controls.
+- Convert images to RX2 textures for Xbox 360
+  (`assets/genrx2` pipeline, up to 256x256).
 - Repack the edited cache to `cache/data/createacharacter.big`.
+- Live character scan for PS3: read the current character's models and
+  textures from RPCS3 memory and preview them (saved to `output/current_items.txt`).
 
 ## Install
 
-Download `UTT-Setup-1.1.1.exe` from the
+Download `UTT-Setup-1.1.4.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -73,8 +77,8 @@ Collaborators with write access can publish installers without the GitHub CLI:
    separate Git installation.
 3. Run `build_installer.bat`.
 4. Open the repository's **Releases** page and choose **Draft a new release**.
-5. Create a tag matching the version, such as `v1.1.2`, and attach
-   `build/installer/UTT-Setup-1.1.2.exe`.
+5. Create a tag matching the version, such as `v1.1.4`, and attach
+   `build/installer/UTT-Setup-1.1.4.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release
@@ -82,10 +86,14 @@ asset when correcting the build for that exact version.
 
 ## Credits
 
-- duckyinnit — everything
-- itsclaudeya — model viewer
-- Salix — Get Current Models And Textures
-<sub>hi its me itscloudya</sub>
+ - duckyinnit — everything
+ - itsclaudeya — model viewer
+ - Salix — Get Current Models And Textures
+ - S4M — PSG Converter
+ - Wisp — RX2 Converter
+ - GHFear — RX2 Parse
+ - Tuukkas — RX2
+ <sub>hi its me itscloudya</sub>
 
 ## License
 

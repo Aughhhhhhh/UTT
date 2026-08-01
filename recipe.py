@@ -95,6 +95,24 @@ def write_items_txt(items: list, output_folder: Path) -> Path:
     return txt_path
 
 
+def read_items_txt(txt_path) -> list:
+    """Reverse of format_items: load items from a saved current_items.txt."""
+    items = []
+    current = None
+    for raw in Path(txt_path).read_text(encoding="utf-8").splitlines():
+        if raw.startswith("Item: "):
+            current = {"name": raw[6:].strip(), "model": None, "textures": {}}
+            items.append(current)
+        elif current is not None and raw.startswith("  Model: "):
+            value = raw[9:].strip()
+            current["model"] = None if value in ("", "None") else value
+        elif current is not None and raw.startswith("    "):
+            channel, _, value = raw.strip().partition(":")
+            if value.strip():
+                current["textures"][channel.strip()] = value.strip()
+    return items
+
+
 def scan_and_save(output_folder: Path = None) -> dict:
     rpcs3 = find_rpcs3()
     recipe_bytes = read_recipe_bytes(rpcs3)

@@ -1,5 +1,5 @@
 #define AppName "UTT"
-#define AppVersion "1.2.0"
+#define AppVersion "1.1.4"
 #define AppExeName "UTT.exe"
 
 [Setup]
@@ -34,6 +34,9 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 [Files]
 Source: "build\UTT.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "build\UTT.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\xbx.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\ps3.png"; DestDir: "{app}"; Flags: ignoreversion
+Source: "build\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "build\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]

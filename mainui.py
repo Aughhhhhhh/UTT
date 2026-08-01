@@ -6,17 +6,21 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
+import time
 import traceback
 from pathlib import Path
 
+from PIL import Image
 from PIL.ImageQt import ImageQt
 from PyQt6.QtCore import QEvent, QObject, QRegularExpression, Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QPixmap, QRegularExpressionValidator
+from PyQt6.QtGui import QGuiApplication, QPixmap, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressDialog, QPushButton,
-    QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
-    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsBlurEffect,
+    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSlider, QSpinBox,
+    QSplitter, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 import recipe
@@ -28,8 +32,24 @@ from psg_converter import PSGConverter
 from PSGTx import PSGTx
 
 
-APP_TITLE = "UTT — PSG Tool"
+APP_TITLE = "UTT — rx2/psg tool"
+
+CREDITS_TEXT = (
+    "Credits\n\n"
+    "duckyinnit — everything\n"
+    "itsclaudeya — model viewer\n"
+    "Salix — Get Current Models And Textures\n"
+    "S4M — PSG Converter\n"
+    "Wisp — RX2 Converter\n"
+    "GHFear — RX2 Parse\n"
+    "Tuukkas — RX2"
+)
 HEX_LENGTH = 18
+
+PLATFORMS = {
+    "xbx": {"name": "Xbox 360", "extension": "rx2", "label": "RX2"},
+    "ps3": {"name": "PS3", "extension": "psg", "label": "PSG"},
+}
 
 
 def resource_dir() -> Path:
@@ -72,7 +92,7 @@ def working_dir() -> Path:
 
     source_dir = Path(__file__).parent.resolve()
     build_dir = source_dir / "build"
-    if (build_dir / "cache").is_dir():
+    if any((build_dir / "cache" / platform).is_dir() for platform in PLATFORMS):
         return build_dir
     return source_dir
 
@@ -182,6 +202,11 @@ class TitleBar(QFrame):
         credits_button.clicked.connect(window._show_credits)
         layout.addWidget(credits_button)
 
+        settings_button = QPushButton("Settings")
+        settings_button.setObjectName("settingsButton")
+        settings_button.clicked.connect(window._show_settings)
+        layout.addWidget(settings_button)
+
         self.minimize_button = self._window_button("—", "Minimize")
         self.minimize_button.clicked.connect(window.showMinimized)
         layout.addWidget(self.minimize_button)
@@ -224,9 +249,188 @@ class TitleBar(QFrame):
         super().mousePressEvent(event)
 
 
+class PlatformCard(QWidget):
+    """Clickable platform card: image blurs and shows a text overlay on hover."""
+    clicked = pyqtSignal()
+
+    def __init__(self, image_path: str, text: str, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("platformCard")
+        self.setMinimumSize(380, 380)
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(14, 14, 14, 14)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            pixmap = QPixmap(400, 400)
+            pixmap.fill(Qt.GlobalColor.darkGray)
+        self.image_label.setPixmap(pixmap.scaled(
+            400,
+            400,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+        layout.addWidget(self.image_label, 0, 0)
+
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("platformText")
+        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setWordWrap(True)
+        self.text_label.setVisible(False)
+        layout.addWidget(self.text_label, 0, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def enterEvent(self, event):
+        effect = QGraphicsBlurEffect(self.image_label)
+        effect.setBlurRadius(14)
+        self.image_label.setGraphicsEffect(effect)
+        self.text_label.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.image_label.setGraphicsEffect(None)
+        self.text_label.setVisible(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
+class PlatformPicker(QDialog):
+    """First-run gate: choose the console (Xbox 360 / PS3) before anything else."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected = ""
+        self.setWindowTitle(f"{APP_TITLE} — Choose Platform")
+        self.setModal(True)
+        self.setMinimumSize(920, 560)
+        self.setStyleSheet("""
+            QWidget { background: #202124; color: #f1f3f4; font-size: 14px; }
+            QLabel#platformTitle { font-size: 26px; font-weight: 700; }
+            QLabel#platformSubtitle { color: #aeb4bd; }
+            QLabel#platformText {
+                background: rgba(20, 20, 24, 210); color: #ffffff;
+                font-size: 19px; font-weight: 700; padding: 14px 22px;
+                border-radius: 12px;
+            }
+            QWidget#platformCard {
+                background: #2b2c2f; border: 1px solid #3c4043;
+                border-radius: 18px;
+            }
+            QWidget#platformCard:hover { border: 1px solid #8ab4f8; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(48, 36, 48, 36)
+        layout.setSpacing(18)
+
+        title = QLabel("Choose your platform")
+        title.setObjectName("platformTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Each console stores its textures differently. "
+            "Pick the one you are modding for."
+        )
+        subtitle.setObjectName("platformSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(subtitle)
+
+        row = QHBoxLayout()
+        row.setSpacing(28)
+        self.xbx_card = PlatformCard(
+            str(resource_file("xbx.png")), "for rx2, xbox, Recomp", self
+        )
+        self.ps3_card = PlatformCard(
+            str(resource_file("ps3.png")), "for psg, ps3, rpcs3", self
+        )
+        self.xbx_card.clicked.connect(lambda: self._choose("xbx"))
+        self.ps3_card.clicked.connect(lambda: self._choose("ps3"))
+        row.addWidget(self.xbx_card, 1)
+        row.addWidget(self.ps3_card, 1)
+        layout.addLayout(row, 1)
+
+    def _choose(self, platform: str):
+        self.selected = platform
+        self.accept()
+
+
+def platform_file() -> Path:
+    return working_dir() / "platform.txt"
+
+
+def get_saved_platform() -> str:
+    try:
+        value = platform_file().read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return ""
+    return value if value in PLATFORMS else ""
+
+
+def save_platform(platform: str) -> None:
+    if platform not in PLATFORMS:
+        return
+    try:
+        platform_file().write_text(platform, encoding="utf-8")
+    except OSError:
+        pass
+
+
+def choose_platform(parent=None) -> str:
+    """Return the chosen platform, showing the picker only when none is saved."""
+    saved = get_saved_platform()
+    if saved:
+        return saved
+    picker = PlatformPicker(parent)
+    picker.exec()
+    if picker.selected:
+        save_platform(picker.selected)
+    return picker.selected
+
+
+def rx2_preview_image(path: Path, opaque: bool = False):
+    """Decode the first decodable texture of an RX2 file into a PIL RGBA image.
+
+    With opaque=True, any partially transparent pixel (alpha > 0) is raised
+    to full opacity, mirroring PSGTx's "force visible pixels" cleanup.
+    """
+    try:
+        from rx2_parser import parse_rx2
+    except ImportError:
+        return None
+    try:
+        rx2 = parse_rx2(path)
+    except Exception:
+        return None
+    for texture in rx2.textures:
+        try:
+            image = texture.to_pil()
+        except Exception:
+            continue
+        if opaque:
+            image = _force_opaque(image)
+        return image
+    return None
+
+
+def _force_opaque(image) -> "PIL Image":
+    """Raise every visible pixel (alpha > 0) to full opacity."""
+    rgba = image.convert("RGBA")
+    alpha = rgba.getchannel("A")
+    alpha = alpha.point(lambda value: 255 if value > 0 else 0)
+    rgba.putalpha(alpha)
+    return rgba
+
+
 class ArchivePicker(QDialog):
     """Non-dismissable first-run gate used to select createacharacter.big."""
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, platform: str = "ps3"):
         super().__init__(parent)
         self.selected_path: Path | None = None
         self.setWindowTitle("Select createacharacter.big")
@@ -234,13 +438,16 @@ class ArchivePicker(QDialog):
         self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self.setMinimumWidth(520)
 
+        info = PLATFORMS[platform]
         layout = QVBoxLayout(self)
         title = QLabel("Select your createacharacter.big file")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
         layout.addWidget(QLabel(
             "UTT needs the game archive before it can list or preview textures. "
-            "The archive will be extracted into a local cache folder beside UTT."
+            "The archive will be extracted into a local cache folder beside UTT.\n\n"
+            f"Platform: {info['name']} — extracted files will be stored as "
+            f".{info['extension']} files under cache\\{platform}."
         ))
         row = QHBoxLayout()
         self.path_label = QLabel("No archive selected")
@@ -267,14 +474,25 @@ class ArchivePicker(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, model_loader):
+    def __init__(self, model_loader, platform: str = "ps3"):
         super().__init__()
         self.model_loader = model_loader
+        self.platform = platform
+        self.platform_info = PLATFORMS[platform]
+        if self.platform == "xbx":
+            self.accent, self.accent_hover = "#107c10", "#1e9e5a"
+            self.accent_dark, self.accent_soft = "#2d7a46", "#6fbf73"
+        else:
+            self.accent, self.accent_hover = "#5b86e5", "#7299ec"
+            self.accent_dark, self.accent_soft = "#536d9f", "#8ab4f8"
+        self.psg_extension = self.platform_info["extension"]
         self.root_dir = resource_dir()
         self.user_dir = working_dir()
         self.assets_dir = self.root_dir / "assets"
-        self.cache_dir = self.user_dir / "cache"
-        self.output_dir = self.user_dir / "exports"
+        self.cache_dir = self.user_dir / "cache" / self.platform
+        self.output_dir = (
+            self.user_dir / "exports" / ("xbx" if self.platform == "xbx" else "psg")
+        )
         self.converter = PSGConverter(str(self.assets_dir))
         self.archive_manager = ArchiveManager(self.assets_dir / "bigfile.exe")
         self.psg_index: dict[str, list[Path]] = {}
@@ -290,6 +508,7 @@ class MainWindow(QMainWindow):
         self.repack_progress: QProgressDialog | None = None
         self._rpcs3 = None
         self._character_items: list = []
+        self._character_from_save = False
         self._character_model_hex = ""
         self._character_texture: PSGTx | None = None
 
@@ -302,6 +521,7 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._apply_style()
         self._load_catalog()
+        self._load_saved_character_items()
         self._restore_cache_or_request_archive()
 
     def _build_ui(self):
@@ -318,7 +538,8 @@ class MainWindow(QMainWindow):
         self.tabs.tabBar().setExpanding(True)
         self.tabs.addTab(self._make_browser_tab(), "Browse")
         self.tabs.addTab(self._make_convert_tab(), "Convert")
-        self.tabs.addTab(self._make_character_tab(), "Character")
+        if self.platform == "ps3":
+            self.tabs.addTab(self._make_character_tab(), "Character")
         shell_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(shell)
 
@@ -326,7 +547,9 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         header = QHBoxLayout()
-        self.archive_status = QLabel("Archive not loaded")
+        self.archive_status = QLabel(
+            f"{self.platform_info['name']} ({self.platform_info['label']}) — archive not loaded"
+        )
         self.archive_status.setObjectName("status")
         self.repack_button = QPushButton("Repack archive")
         self.repack_button.setEnabled(False)
@@ -383,7 +606,11 @@ class MainWindow(QMainWindow):
         self.selected_label = QLabel("No texture selected")
         preview_layout.addWidget(self.selected_label)
         self.force_opaque = QCheckBox("Force visible pixels to 255 opacity")
-        self.force_opaque.setToolTip("Off preserves the alpha stored in the PSG. On applies PSGTx's alpha cleanup.")
+        self.force_opaque.setChecked(True)
+        self.force_opaque.setToolTip(
+            "Off preserves the alpha stored in the texture. On raises every "
+            "visible pixel (alpha > 0) to full opacity."
+        )
         self.force_opaque.toggled.connect(self._refresh_preview_alpha)
         preview_layout.addWidget(self.force_opaque)
         export_btn = QPushButton("Export preview…")
@@ -426,12 +653,13 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(32, 24, 32, 24)
         layout.setSpacing(14)
 
-        heading = QLabel("Image to PSG")
+        heading = QLabel(f"Image to {self.platform_info['label']}")
         heading.setObjectName("convertTitle")
         heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(heading)
         description = QLabel(
-            "Drop or choose an image, set its square resolution, then enter the PSG hex name."
+            f"Drop or choose an image, set its square resolution, then enter the "
+            f"{self.platform_info['label']} hex name."
         )
         description.setObjectName("convertDescription")
         description.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -482,6 +710,11 @@ class MainWindow(QMainWindow):
         self.resolution.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.resolution.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.resolution.setValue(512)
+        if self.platform == "xbx":
+            # genrx2 only produces valid RX2 files up to 256x256; larger
+            # inputs yield corrupt headers or no file at all.
+            self.resolution.setMaximum(256)
+            self.resolution.setValue(256)
         resolution_row = QHBoxLayout()
         self.resolution_down = QPushButton("↓")
         self.resolution_down.setObjectName("resolutionButton")
@@ -514,19 +747,28 @@ class MainWindow(QMainWindow):
         self.convert_opacity_text.setObjectName("convertDescription")
         opacity_row.addWidget(self.convert_opacity_text)
         controls_layout.addLayout(opacity_row)
+        if self.platform == "xbx":
+            for widget in (opacity_row.itemAt(0).widget(),
+                           self.convert_opacity, self.convert_opacity_text):
+                widget.setVisible(False)
 
         output_row = QHBoxLayout()
         output_row.setSpacing(12)
         output_row.addWidget(QLabel("Output folder"))
         self.convert_output_input = QLineEdit(str(self.output_dir))
-        self.convert_output_input.setToolTip("PSG files will be saved into this folder. Defaults to the exports folder.")
+        self.convert_output_input.setToolTip(
+            f"{self.platform_info['label']} files will be saved into this folder. "
+            "Defaults to the exports folder."
+        )
         output_row.addWidget(self.convert_output_input, 1)
         browse_btn = QPushButton("Browse…")
         browse_btn.clicked.connect(self._choose_output_folder)
         output_row.addWidget(browse_btn)
         controls_layout.addLayout(output_row)
 
-        self.convert_button = QPushButton("Convert image to PSG")
+        self.convert_button = QPushButton(
+            f"Convert image to {self.platform_info['label']}"
+        )
         self.convert_button.setObjectName("convertButton")
         self.convert_button.setEnabled(False)
         self.convert_button.clicked.connect(self._convert_image)
@@ -594,6 +836,7 @@ class MainWindow(QMainWindow):
         self.character_texture_label.setObjectName("preview")
         texture_layout.addWidget(self.character_texture_label, 1)
         self.character_force_opaque = QCheckBox("Force visible pixels to 255 opacity")
+        self.character_force_opaque.setChecked(True)
         self.character_force_opaque.setToolTip("Off preserves the alpha stored in the PSG. On applies PSGTx's alpha cleanup.")
         self.character_force_opaque.toggled.connect(self._refresh_character_texture_preview)
         texture_layout.addWidget(self.character_force_opaque)
@@ -618,21 +861,21 @@ class MainWindow(QMainWindow):
             QFrame#titleBar { background: #2b2c2f; border-bottom: 1px solid #3c4043; }
             QFrame#titleBar QLabel { background: transparent; }
             QLabel#windowTitle { color: #d9dce1; font-size: 13px; font-weight: 600; }
-            QPushButton#creditsButton { background: transparent; color: #aeb4bd; border-radius: 8px; padding: 6px 11px; font-weight: 500; }
-            QPushButton#creditsButton:hover { background: #3c4043; color: #ffffff; }
+            QPushButton#creditsButton, QPushButton#settingsButton { background: transparent; color: #aeb4bd; border-radius: 8px; padding: 6px 11px; font-weight: 500; }
+            QPushButton#creditsButton:hover, QPushButton#settingsButton:hover { background: #3c4043; color: #ffffff; }
             QPushButton#titleWindowButton, QPushButton#titleCloseButton { background: transparent; border-radius: 0; padding: 0; font-size: 17px; font-weight: 400; }
             QPushButton#titleWindowButton:hover { background: #3c4043; }
             QPushButton#titleCloseButton:hover { background: #c42b1c; }
             QTabWidget::pane { border: 0; border-top: 1px solid #3c4043; }
             QTabBar::tab { background: #303134; color: #c7ccd4; padding: 9px 26px; margin: 7px 5px; border: 1px solid #4a4d52; border-radius: 18px; }
             QTabBar::tab:hover { background: #3c4043; color: #ffffff; }
-            QTabBar::tab:selected { background: #5b86e5; color: #ffffff; border: 1px solid #5b86e5; }
-            QPushButton { background: #5b86e5; border: 0; border-radius: 16px; padding: 9px 16px; font-weight: 600; }
-            QPushButton:hover { background: #7299ec; }
+            QTabBar::tab:selected { background: @accent; color: #ffffff; border: 1px solid @accent; }
+            QPushButton { background: @accent; border: 0; border-radius: 16px; padding: 9px 16px; font-weight: 600; }
+            QPushButton:hover { background: @accent_hover; }
             QPushButton:disabled { background: #45474b; color: #9aa0a6; }
             QLineEdit, QTreeWidget, QSpinBox { background: #2b2c2f; border: 1px solid #4a4d52; border-radius: 9px; padding: 7px; }
             QTreeWidget::item { padding: 5px; border-radius: 6px; }
-            QTreeWidget::item:selected { background: #536d9f; }
+            QTreeWidget::item:selected { background: @accent_dark; }
             QLabel#preview { background: #18191b; border: 1px dashed #5f6368; border-radius: 16px; }
             QLabel#dialogTitle { font-size: 20px; font-weight: 700; }
             QLabel#status { color: #a9c7fa; }
@@ -641,15 +884,18 @@ class MainWindow(QMainWindow):
             QLabel#convertTitle { font-size: 26px; font-weight: 700; }
             QLabel#convertDescription, QLabel#selectedImagePath, QLabel#modelDetails { color: #aeb4bd; }
             QLabel#imageDropZone { background: #18191b; border: 2px dashed #5f6368; border-radius: 16px; color: #aeb4bd; font-size: 17px; }
-            QLabel#imageDropZone:hover { border-color: #8ab4f8; color: #f1f3f4; }
+            QLabel#imageDropZone:hover { border-color: @accent_soft; color: #f1f3f4; }
             QLabel#modelTitle { font-size: 18px; font-weight: 700; }
             QLineEdit#aliasInput { font-family: Consolas; font-size: 16px; padding: 10px; }
             QPushButton#resolutionButton { font-size: 21px; padding: 5px 10px; }
             QPushButton#convertButton { font-size: 16px; padding: 12px 18px; }
             QSlider::groove:horizontal { height: 7px; background: #4a4d52; border-radius: 3px; }
-            QSlider::sub-page:horizontal { background: #8ab4f8; border-radius: 3px; }
+            QSlider::sub-page:horizontal { background: @accent_soft; border-radius: 3px; }
             QSlider::handle:horizontal { width: 18px; margin: -6px 0; background: #d2e3fc; border-radius: 9px; }
-        """)
+        """.replace("@accent", self.accent)
+            .replace("@accent_hover", self.accent_hover)
+            .replace("@accent_dark", self.accent_dark)
+            .replace("@accent_soft", self.accent_soft))
 
     def _load_catalog(self):
         catalog_candidates = [
@@ -680,7 +926,9 @@ class MainWindow(QMainWindow):
             mode = self.browser_mode.currentText().strip().lower()
         if mode == "models":
             self.browser_stack.setCurrentWidget(self.model_page)
-            self.model_tree.setHeaderLabels(["Model folder / PSG file"])
+            self.model_tree.setHeaderLabels([
+                f"Model folder / {self.platform_info['label']} file"
+            ])
             self._load_models_tree()
             self.preview_label.setVisible(False)
             self.texture_export_button.setVisible(False)
@@ -727,7 +975,7 @@ class MainWindow(QMainWindow):
                     added = True
                 else:
                     parent.removeChild(node)
-            elif child.suffix.lower() == ".psg" and (
+            elif child.suffix.lower() == "." + self.psg_extension and (
                 parent_matches or not search or search in child.name.lower()
             ):
                 leaf = QTreeWidgetItem(parent, [child.name])
@@ -765,7 +1013,7 @@ class MainWindow(QMainWindow):
         return has_children
 
     def _request_archive(self):
-        picker = ArchivePicker(self)
+        picker = ArchivePicker(self, self.platform)
         if picker.exec() == QDialog.DialogCode.Accepted and picker.selected_path:
             self._extract_archive(picker.selected_path)
 
@@ -837,7 +1085,9 @@ class MainWindow(QMainWindow):
 
     def _restore_cache_or_request_archive(self):
         """Use the persistent cache beside the EXE whenever it is available."""
-        if self.cache_dir.is_dir() and any(self.cache_dir.rglob("*.psg")):
+        if self.cache_dir.is_dir() and any(
+            self.cache_dir.rglob(f"*.{self.psg_extension}")
+        ):
             self.archive_status.setText("Loading existing texture cache…")
             self._start_worker(self._build_psg_index, self._archive_loaded)
         else:
@@ -879,23 +1129,33 @@ class MainWindow(QMainWindow):
 
     def _build_psg_index(self) -> dict[str, list[Path]]:
         index: dict[str, list[Path]] = {}
-        for file in self.cache_dir.rglob("*.psg"):
+        for file in self.cache_dir.rglob(f"*.{self.psg_extension}"):
             index.setdefault(file.stem.lower(), []).append(file)
         return index
 
     def _index_cache(self):
         self.psg_index = self._build_psg_index() if self.cache_dir.exists() else {}
-        self.archive_status.setText(f"Cache ready — {sum(map(len, self.psg_index.values()))} PSG files found")
+        self.archive_status.setText(
+            f"Cache ready — {sum(map(len, self.psg_index.values()))} "
+            f"{self.platform_info['label']} files found"
+        )
         self.repack_button.setEnabled(bool(self.psg_index))
 
     def _archive_loaded(self, index):
         self.psg_index = index
         self._refresh_browser_tree()
-        self.archive_status.setText(f"Cache ready — {sum(map(len, index.values()))} PSG files found")
+        self.archive_status.setText(
+            f"Cache ready — {sum(map(len, index.values()))} "
+            f"{self.platform_info['label']} files found"
+        )
         self.repack_button.setEnabled(bool(index))
         if self.unpack_progress:
             self.unpack_progress.close()
             self.unpack_progress = None
+        if self._character_from_save and self._character_items:
+            self._populate_character_tree(
+                self._character_items, self._character_output_folder
+            )
 
     def _on_texture_selected(self):
         mode = self.browser_mode.currentData()
@@ -910,6 +1170,12 @@ class MainWindow(QMainWindow):
             return
         if isinstance(alias, tuple) and alias[0] == "psg_model":
             path = Path(alias[1])
+            if path.suffix.lower() == ".rx2":
+                self.model_preview.clear(
+                    "RX2 model preview is not supported yet.\n"
+                    "Xbox 360 models require a Noesis exporter plugin."
+                )
+                return
             self.current_model_path = path
             self.model_preview.show_loading(path)
             self._start_worker(
@@ -927,7 +1193,16 @@ class MainWindow(QMainWindow):
             self.current_image = None
             return
         self.preview_label.setText("Loading preview…")
-        self._start_worker(lambda: PSGTx(str(matches[0])), self._preview_loaded)
+        path = matches[0]
+        if path.suffix.lower() == ".rx2":
+            self._rx2_path = path
+            self._start_worker(
+                lambda: rx2_preview_image(path, self.force_opaque.isChecked()),
+                self._rx2_preview_loaded,
+            )
+            return
+        self._rx2_path = None
+        self._start_worker(lambda: PSGTx(str(path)), self._preview_loaded)
 
     def _model_loaded(self, result):
         path, model = result
@@ -943,13 +1218,35 @@ class MainWindow(QMainWindow):
             Qt.TransformationMode.SmoothTransformation,
         ))
 
+    def _rx2_preview_loaded(self, image):
+        if image is None:
+            self.current_image = None
+            self.current_texture = None
+            self.preview_label.setText("This RX2 contains no decodable textures.")
+            return
+        self.current_image = image
+        self.current_texture = None
+        pixmap = QPixmap.fromImage(ImageQt(image.convert("RGBA")))
+        self.preview_label.setPixmap(pixmap.scaled(
+            self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+
     def _refresh_preview_alpha(self):
         if self.current_texture is not None:
             self._preview_loaded(self.current_texture)
+            return
+        rx2_path = getattr(self, "_rx2_path", None)
+        if rx2_path is not None:
+            self.preview_label.setText("Loading preview…")
+            self._start_worker(
+                lambda: rx2_preview_image(rx2_path, self.force_opaque.isChecked()),
+                self._rx2_preview_loaded,
+            )
 
     def _export_preview(self):
         if self.current_image is None:
-            QMessageBox.information(self, APP_TITLE, "Load a PSG preview before exporting.")
+            QMessageBox.information(self, APP_TITLE, "Load a preview before exporting.")
             return
         default = self.output_dir / f"{self.current_alias}.png"
         path, _ = QFileDialog.getSaveFileName(
@@ -960,7 +1257,13 @@ class MainWindow(QMainWindow):
             return
         try:
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-            self.current_texture.export_tx(path, self.force_opaque.isChecked())
+            if self.current_texture is not None:
+                self.current_texture.export_tx(path, self.force_opaque.isChecked())
+            else:
+                image = self.current_image
+                if path.lower().endswith((".jpg", ".jpeg")):
+                    image = image.convert("RGB")
+                image.save(path)
             QMessageBox.information(self, APP_TITLE, f"Exported:\n{path}")
         except Exception as exc:
             self._show_error(str(exc))
@@ -1017,10 +1320,18 @@ class MainWindow(QMainWindow):
         )
 
     def _character_scan_finished(self, result):
-        self._character_items = result["items"]
-        self._character_output_folder = result["output_folder"]
+        self._populate_character_tree(result["items"], result["output_folder"])
+        self.character_scan_button.setEnabled(True)
+        self.rpcs3_status.setText(
+            f"Found {len(self._character_items)} items — saved to {result['txt_path']}"
+        )
+
+    def _populate_character_tree(self, items, output_folder):
+        """Rebuild the character tree from scanned items (kept collapsed)."""
+        self._character_items = items
+        self._character_output_folder = output_folder
         self.character_tree.clear()
-        for item in self._character_items:
+        for item in items:
             part = QTreeWidgetItem([item["name"]])
             part.setData(0, Qt.ItemDataRole.UserRole, ("part", item))
             if not self._character_item_cached(item):
@@ -1052,15 +1363,29 @@ class MainWindow(QMainWindow):
                 texture.setData(0, Qt.ItemDataRole.UserRole, ("texture", None, None))
             part.addChild(texture)
             self.character_tree.addTopLevelItem(part)
-        self.character_tree.expandAll()
-        self.character_scan_button.setEnabled(True)
         self.character_open_button.setEnabled(True)
-        self.rpcs3_status.setText(
-            f"Found {len(self._character_items)} items — saved to {result['txt_path']}"
-        )
         if self.character_tree.topLevelItemCount():
             first = self.character_tree.topLevelItem(0)
             self.character_tree.setCurrentItem(first.child(0) if first.childCount() else first)
+
+    def _load_saved_character_items(self):
+        """Reuse the previous scan when output\\current_items.txt exists."""
+        if self.platform != "ps3":
+            return
+        txt_path = recipe.get_base_path() / "output" / "current_items.txt"
+        if not txt_path.is_file():
+            return
+        try:
+            items = recipe.read_items_txt(txt_path)
+        except OSError:
+            return
+        if not items:
+            return
+        self._character_from_save = True
+        self._populate_character_tree(items, txt_path.parent)
+        self.rpcs3_status.setText(
+            f"Loaded {len(items)} items from current_items.txt — rescan to refresh"
+        )
 
     def _character_scan_failed(self, details: str):
         self.character_scan_button.setEnabled(True)
@@ -1159,15 +1484,17 @@ class MainWindow(QMainWindow):
             subprocess.Popen(["xdg-open", str(folder)])
 
     def _show_cache_menu(self, tree, pos):
-        """Right-click menu that reveals a cached PSG file in Explorer."""
+        """Right-click menu: copy the hex name and/or reveal the PSG in Explorer."""
         node = tree.itemAt(pos)
         if node is None:
             return
         data = node.data(0, Qt.ItemDataRole.UserRole)
         if not data:
             return
+        hex_name = None
         file_path = None
         if isinstance(data, str):
+            hex_name = data
             matches = self.psg_index.get(data, [])
             if matches:
                 file_path = matches[0]
@@ -1176,20 +1503,47 @@ class MainWindow(QMainWindow):
             if kind == "part":
                 return
             if kind == "psg_model":
-                file_path = Path(data[1])
-            elif kind == "model" and data[2]:
-                file_path = Path(data[2])
-            elif kind == "texture" and data[2]:
-                file_path = Path(data[2])
-        if file_path is None or not Path(file_path).is_file():
-            QMessageBox.information(
-                self, APP_TITLE, "No cached PSG file for this item."
-            )
-            return
+                path = Path(data[1])
+                file_path = path
+                hex_name = path.stem if path.stem.lower().startswith("0x") else "0x" + path.stem
+            elif kind == "model":
+                hex_name = data[1]
+                if data[2]:
+                    file_path = Path(data[2])
+            elif kind == "texture":
+                hex_name = data[1]
+                if data[2]:
+                    file_path = Path(data[2])
         menu = QMenu(self)
-        action = menu.addAction("Search in Explorer")
-        if menu.exec(tree.viewport().mapToGlobal(pos)) is action:
+        copy_action = menu.addAction("Copy hex name")
+        copy_action.setEnabled(bool(hex_name))
+        export_action = menu.addAction("Export file…")
+        export_action.setEnabled(file_path is not None and Path(file_path).is_file())
+        explore_action = menu.addAction("Search in Explorer")
+        explore_action.setEnabled(
+            file_path is not None and Path(file_path).is_file()
+        )
+        chosen = menu.exec(tree.viewport().mapToGlobal(pos))
+        if chosen is copy_action and hex_name:
+            QGuiApplication.clipboard().setText(hex_name)
+        elif chosen is export_action and file_path is not None:
+            self._export_cache_file(Path(file_path))
+        elif chosen is explore_action and file_path is not None:
             self._open_in_explorer(file_path)
+
+    def _export_cache_file(self, path: Path):
+        default = self.output_dir / path.name
+        target, _ = QFileDialog.getSaveFileName(
+            self, "Export file", str(default), "All files (*.*)"
+        )
+        if not target:
+            return
+        try:
+            Path(target).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+            QMessageBox.information(self, APP_TITLE, f"Exported:\n{target}")
+        except OSError as exc:
+            self._show_error(str(exc))
 
     def _open_in_explorer(self, path: Path):
         path = Path(path).resolve()
@@ -1259,6 +1613,14 @@ class MainWindow(QMainWindow):
             self._show_error("The hex string contains non-hexadecimal characters.")
             return
         self.convert_button.setEnabled(False)
+        if self.platform == "xbx":
+            self._start_worker(
+                lambda: self._convert_image_rx2(
+                    source, folder, alias, self.resolution.value()
+                ),
+                self._conversion_finished,
+            )
+            return
         self._start_worker(
             lambda: self.converter.convert_image(
                 source,
@@ -1270,9 +1632,99 @@ class MainWindow(QMainWindow):
             self._conversion_finished,
         )
 
+    def _convert_image_rx2(self, source: str, folder: str, alias: str,
+                           resolution: int = 512) -> str:
+        """Convert an image to an RX2 texture using the genrx2 pipeline.
+
+        genrx2 runs with the bundled tools (genrx2.exe, Bundler.exe and the
+        example.rx2 template) copied into a scratch folder, emits output.rx2
+        there, then the file is renamed to the alias and moved to the output
+        folder. The texture is written at roughly 12% opacity for a subtler
+        in-game look.
+        """
+        tools_dir = self.assets_dir / "genrx2"
+        required = [tools_dir / "genrx2.exe", tools_dir / "Bundler.exe",
+                    tools_dir / "example.rx2"]
+        for tool in required:
+            if not tool.is_file():
+                raise FileNotFoundError(
+                    f"Required tool not found: {tool}. "
+                    "Keep the assets folder next to UTT.exe."
+                )
+        if not 16 <= resolution <= 4096:
+            raise ValueError("Resolution must be between 16 and 4096")
+        if resolution > 256:
+            # genrx2 only produces valid files up to 256x256.
+            resolution = 256
+        output_path = Path(folder).resolve() / f"{alias}.rx2"
+        scratch = Path(tempfile.mkdtemp(prefix="utt_rx2_"))
+        try:
+            for tool in required:
+                target = scratch / tool.name
+                for _attempt in range(5):
+                    try:
+                        shutil.copy2(tool, target)
+                        break
+                    except PermissionError:
+                        time.sleep(0.3)
+                else:
+                    shutil.copy2(tool, target)
+            tga_path = scratch / "input.tga"
+            with Image.open(source) as image:
+                image = image.convert("RGBA")
+                image = image.resize(
+                    (resolution, resolution), Image.Resampling.LANCZOS
+                )
+                # genrx2 keeps the TGA alpha channel, and the in-game
+                # character texture blends best around 10-15% opacity.
+                image.putalpha(Image.new("L", image.size, 30))
+                image.save(tga_path, format="TGA")
+            result = subprocess.run(
+                [str(scratch / "genrx2.exe"), str(tga_path)],
+                cwd=str(scratch),
+                capture_output=True,
+                text=True,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            if result.returncode:
+                detail = (result.stdout or result.stderr).strip()
+                raise RuntimeError(
+                    "genrx2 failed" + (f": {detail}" if detail else
+                                       f" (exit code {result.returncode})")
+                )
+            generated = scratch / "output.rx2"
+            if not generated.is_file():
+                detail = (result.stdout or result.stderr).strip()
+                raise RuntimeError(
+                    "genrx2 finished without creating output.rx2"
+                    + (f" ({detail})" if detail else "")
+                    + " — note that genrx2 supports a maximum of 256x256."
+                )
+            # genrx2 leaves the game-layout format/size fields of the texture
+            # info block at zero, so external viewers report a 1x8 image;
+            # restore them before shipping the file.
+            from rx2_parser import patch_texture_entry
+            data = patch_texture_entry(generated.read_bytes(),
+                                       resolution, resolution)
+            generated.write_bytes(data)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            os.replace(generated, output_path)
+        finally:
+            # Antivirus may keep a handle on the copied tools for a moment,
+            # so retry the removal and never fail the conversion over it.
+            for _attempt in range(5):
+                if not scratch.exists():
+                    break
+                shutil.rmtree(scratch, ignore_errors=True)
+                time.sleep(0.5)
+        return str(output_path)
+
     def _conversion_finished(self, output):
         self._update_convert_ready()
-        QMessageBox.information(self, APP_TITLE, f"PSG created:\n{output}")
+        QMessageBox.information(
+            self, APP_TITLE,
+            f"{self.platform_info['label']} created:\n{output}",
+        )
 
     def _start_worker(self, task, on_success, on_failure=None):
         thread = QThread(self)
@@ -1319,11 +1771,75 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             "UTT Credits",
-            "Credits\n\n"
-            "duckyinnit — everything\n"
-            "itsclaudeya — model viewer\n"
-            "Salix — Get Current Models And Textures",
+            CREDITS_TEXT,
         )
+
+    def _show_settings(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Settings")
+        dialog.setModal(True)
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(14)
+        title = QLabel("Settings")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        platform_row = QHBoxLayout()
+        platform_row.setSpacing(12)
+        platform_row.addWidget(QLabel("Platform mode"))
+        combo = QComboBox()
+        for key, info in PLATFORMS.items():
+            combo.addItem(info["name"], key)
+        combo.setCurrentIndex(combo.findData(self.platform))
+        platform_row.addWidget(combo, 1)
+        layout.addLayout(platform_row)
+
+        note = QLabel(
+            "Switching platform restarts UTT in that mode. Textures are read from "
+            f"the {PLATFORMS[self.platform]['name']} cache; if no cache exists for the "
+            "new platform you will be asked to extract its createacharacter.big."
+        )
+        note.setWordWrap(True)
+        note.setObjectName("convertDescription")
+        layout.addWidget(note)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dialog.reject)
+        apply_button = QPushButton("Switch platform")
+        apply_button.clicked.connect(dialog.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_button)
+        layout.addLayout(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        target = combo.currentData()
+        if target == self.platform:
+            return
+        save_platform(target)
+        self._restart_app()
+
+    def _restart_app(self):
+        try:
+            if getattr(sys, "frozen", False):
+                command = [sys.executable]
+            else:
+                command = [
+                    sys.executable,
+                    str(Path(__file__).resolve().parent / "main.py"),
+                ]
+            command.extend(sys.argv[1:])
+            subprocess.Popen(
+                command,
+                cwd=str(Path(__file__).resolve().parent),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError:
+            pass
+        self.close()
 
     def _toggle_maximized(self):
         if self.isMaximized():

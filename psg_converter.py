@@ -56,7 +56,9 @@ class PSGConverter:
         final_psg = output_path / f"{alias}.psg"
         generated_psg = self.psg_cli_dir / f"{alias}.psg"
 
-        with tempfile.TemporaryDirectory(prefix="utt_convert_") as temp_dir:
+        with tempfile.TemporaryDirectory(
+            prefix="utt_convert_", ignore_cleanup_errors=True
+        ) as temp_dir:
             temp_path = Path(temp_dir)
             temp_png = temp_path / "input.png"
             temp_dds = temp_path / f"{alias}.dds"
