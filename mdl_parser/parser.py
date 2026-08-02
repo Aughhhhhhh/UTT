@@ -12,6 +12,9 @@ from .model import Bone, MaterialParameter, Mesh, PSGModel, VertexAttribute
 
 MAGIC_PS3 = b"\x89RW4ps3"
 MODEL_TYPE_PS3 = b"\x00\x00\x00\x10"
+MAGIC_X360 = b"\x89RW4xb2"
+MODEL_TYPE_X360 = b"\x00\x00\x00\x04"
+MODEL_TYPE_X360_NHL = b"\x00\x00\x08\x00"
 
 TOC_RECORD_SIZE = 24
 TYPE_VERTEX = b"\x00\x02\x00\xEA"
@@ -62,9 +65,32 @@ def is_psg_model(data: bytes | bytearray | memoryview) -> bool:
     )
 
 
+def is_rx2_model(data: bytes | bytearray | memoryview) -> bool:
+    view = memoryview(data)
+    return (
+        len(view) >= 0x5C
+        and bytes(view[:7]) == MAGIC_X360
+        and bytes(view[0x58:0x5C]) in (MODEL_TYPE_X360, MODEL_TYPE_X360_NHL)
+    )
+
+
 def load_psg(path: str | Path, *, strict: bool = False) -> PSGModel:
     source_path = Path(path)
     return parse_psg(source_path.read_bytes(), source_path=source_path, strict=strict)
+
+
+def load_rx2(path: str | Path, *, strict: bool = False) -> PSGModel:
+    source_path = Path(path)
+    return parse_rx2(source_path.read_bytes(), source_path=source_path, strict=strict)
+
+
+def load_model(path: str | Path, *, strict: bool = False) -> PSGModel:
+    """Load a model PSG or RX2, auto-detecting the platform by magic."""
+    source_path = Path(path)
+    data = source_path.read_bytes()
+    if is_rx2_model(data):
+        return parse_rx2(data, source_path=source_path, strict=strict)
+    return parse_psg(data, source_path=source_path, strict=strict)
 
 
 def parse_psg(
@@ -73,15 +99,58 @@ def parse_psg(
     source_path: str | Path | None = None,
     strict: bool = False,
 ) -> PSGModel:
+    return _parse_model(data, source_path=source_path, strict=strict, platform="ps3")
+
+
+def parse_rx2(
+    data: bytes | bytearray | memoryview,
+    *,
+    source_path: str | Path | None = None,
+    strict: bool = False,
+) -> PSGModel:
+    return _parse_model(data, source_path=source_path, strict=strict, platform="xbx")
+
+
+def parse_model(
+    data: bytes | bytearray | memoryview,
+    *,
+    source_path: str | Path | None = None,
+    strict: bool = False,
+) -> PSGModel:
+    """Parse a model PSG or RX2, auto-detecting the platform by magic."""
+    if is_rx2_model(data):
+        return parse_rx2(data, source_path=source_path, strict=strict)
+    return parse_psg(data, source_path=source_path, strict=strict)
+
+
+def _parse_model(
+    data: bytes | bytearray | memoryview,
+    *,
+    source_path: str | Path | None = None,
+    strict: bool = False,
+    platform: str = "ps3",
+) -> PSGModel:
     raw = bytes(data)
-    if len(raw) < 0x74:
-        raise PSGFormatError("File is too small to contain a PSG header")
-    if raw[:7] != MAGIC_PS3:
-        raise PSGFormatError("Not an EA RenderWare4 PS3 file")
-    if raw[0x70:0x74] != MODEL_TYPE_PS3:
-        actual = raw[0x70:0x74].hex(" ")
+    if platform == "xbx":
+        if len(raw) < 0x5C:
+            raise PSGFormatError("File is too small to contain an RX2 header")
+        if raw[:7] != MAGIC_X360:
+            raise PSGFormatError("Not an EA RenderWare4 Xbox 360 file")
+        type_ok = raw[0x58:0x5C] in (MODEL_TYPE_X360, MODEL_TYPE_X360_NHL)
+        type_offset = 0x58
+        type_field = raw[0x58:0x5C]
+    else:
+        if len(raw) < 0x74:
+            raise PSGFormatError("File is too small to contain a PSG header")
+        if raw[:7] != MAGIC_PS3:
+            raise PSGFormatError("Not an EA RenderWare4 PS3 file")
+        type_ok = raw[0x70:0x74] == MODEL_TYPE_PS3
+        type_offset = 0x70
+        type_field = raw[0x70:0x74]
+    if not type_ok:
         raise PSGFormatError(
-            f"PS3 file is not a model PSG (type {actual or '<missing>'})"
+            f"{'X360' if platform == 'xbx' else 'PS3'} file is not a model "
+            f"(type {type_field.hex(' ') or '<missing>'})"
         )
 
     warnings: list[str] = []
@@ -183,7 +252,7 @@ def parse_psg(
         mesh_info_offset = mesh_info_offsets[mesh_index]
 
         try:
-            layout = _parse_mesh_layout(raw, mesh_info_offset, warnings)
+            layout = _parse_mesh_layout(raw, mesh_info_offset, warnings, platform)
             vertices, uvs = _parse_vertices(
                 raw,
                 vertex_resource,
@@ -199,6 +268,7 @@ def parse_psg(
                 len(vertices),
                 warnings,
                 mesh_index,
+                platform,
             )
         except PSGDataError as exc:
             if strict:
@@ -254,13 +324,14 @@ def parse_psg(
         warnings=warnings,
         source_path=Path(source_path) if source_path is not None else None,
         metadata={
-            "magic": MAGIC_PS3,
-            "type": MODEL_TYPE_PS3,
+            "magic": MAGIC_X360 if platform == "xbx" else MAGIC_PS3,
+            "type": raw[type_offset:type_offset + 4],
             "file_count": file_count,
             "file_table": file_table,
             "header_size": header_size,
             "names_location_offset": names_location_offset,
             "names_location": names_location,
+            "platform": platform,
         },
     )
 
@@ -333,20 +404,34 @@ def _parse_material_table(
 
 
 def _parse_mesh_layout(
-    data: bytes, offset: int, warnings: list[str]
+    data: bytes, offset: int, warnings: list[str], platform: str = "ps3"
 ) -> _MeshLayout:
     info = _unpack(data, ">iiHHi", offset, "mesh layout header")
-    descriptor_count = info[3]
+    if platform == "xbx":
+        descriptor_count = info[2]
+        descriptor_size = 16
+        stride_byte_after = True
+    else:
+        descriptor_count = info[3]
+        descriptor_size = 8
+        stride_byte_after = False
     if not 0 < descriptor_count <= 256:
         raise PSGDataError(f"invalid vertex descriptor count {descriptor_count}")
 
     descriptors = [
-        _slice(data, offset + 16 + index * 8, 8, f"vertex descriptor {index}")
+        _slice(data, offset + 16 + index * descriptor_size, descriptor_size,
+               f"vertex descriptor {index}")
         for index in range(descriptor_count)
     ]
-    stride = descriptors[-1][5]
-    if stride == 0:
-        stride = max((descriptor[5] for descriptor in descriptors), default=0)
+    if stride_byte_after:
+        stride = _slice(data, offset + 16 + descriptor_count * descriptor_size, 1,
+                        "vertex stride")[0]
+        if stride == 0:
+            stride = 32
+    else:
+        stride = descriptors[-1][5]
+        if stride == 0:
+            stride = max((descriptor[5] for descriptor in descriptors), default=0)
     if not 0 < stride <= 4096:
         raise PSGDataError(f"invalid vertex stride {stride}")
 
@@ -355,12 +440,15 @@ def _parse_mesh_layout(
     uv1: VertexAttribute | None = None
 
     for descriptor in descriptors:
-        attribute = _classify_descriptor(descriptor)
+        attribute = _classify_descriptor(descriptor, platform)
         if attribute is None:
             attributes.append(
                 VertexAttribute(
                     semantic="unknown",
-                    offset=int.from_bytes(descriptor[2:4], "big"),
+                    offset=int.from_bytes(
+                        descriptor[2:4] if platform == "ps3" else descriptor[0:4],
+                        "big",
+                    ),
                     data_type="raw",
                     components=0,
                     descriptor=descriptor,
@@ -394,7 +482,9 @@ def _parse_mesh_layout(
     )
 
 
-def _classify_descriptor(descriptor: bytes) -> VertexAttribute | None:
+def _classify_descriptor(descriptor: bytes, platform: str = "ps3") -> VertexAttribute | None:
+    if platform == "xbx":
+        return _classify_descriptor_x360(descriptor)
     prefix = descriptor[:2]
     suffix = descriptor[6:8]
     raw_offset = int.from_bytes(descriptor[2:4], "big")
@@ -421,6 +511,42 @@ def _classify_descriptor(descriptor: bytes) -> VertexAttribute | None:
         return VertexAttribute("uv2", raw_offset, "int16", 2, descriptor)
     if descriptor == b"\x00\x2C\x23\x5F\x00\x05\x02\x08":
         return VertexAttribute("uv3", raw_offset, "float16", 2, descriptor)
+    return None
+
+
+def _classify_descriptor_x360(descriptor: bytes) -> VertexAttribute | None:
+    """Classify a 16-byte X360 vertex descriptor record.
+
+    Layout: ``offset:i`` (bytes 0-3), ``type:8s`` (bytes 4-11), ``unknown:i``
+    (bytes 12-15). Positions always live at offset 0 in the buffer (the
+    plugin binds them there); UVs use the descriptor's offset field.
+    """
+    kind = descriptor[4:12]
+    offset = int.from_bytes(descriptor[0:4], "big")
+
+    if kind == b"\x00\x2A\x23\xB9\x00\x00\x00\x01":
+        return VertexAttribute("position", 0, "float32", 3, descriptor)
+    if kind == b"\x00\x1A\x23\x60\x00\x00\x00\x01":
+        return VertexAttribute("position", 0, "float16", 3, descriptor)
+    if kind == b"\x00\x1A\x23\xA6\x00\x00\x00\x01":
+        return VertexAttribute("position", 0, "uint16", 3, descriptor)
+    if kind == b"\x00\x1A\x21\x5A\x00\x00\x00\x01":
+        return VertexAttribute("position", 0, "int16", 3, descriptor)
+
+    if kind == b"\x00\x2C\x23\xA5\x00\x05\x00\x06":
+        return VertexAttribute("uv1", offset, "float32", 2, descriptor)
+    if kind in (b"\x00\x1A\x23\x60\x00\x05\x00\x06",
+                b"\x00\x2C\x23\x5F\x00\x05\x00\x06"):
+        return VertexAttribute("uv1", offset, "float16", 2, descriptor)
+    if kind == b"\x00\x2C\x21\x59\x00\x05\x00\x06":
+        return VertexAttribute("uv1", offset, "int16", 2, descriptor)
+    if kind == b"\x00\x2C\x20\x59\x00\x05\x00\x06":
+        return VertexAttribute("uv1", offset, "uint16", 2, descriptor)
+
+    if kind == b"\x00\x2C\x21\x59\x00\x05\x01\x07":
+        return VertexAttribute("uv2", offset, "int16", 2, descriptor)
+    if kind == b"\x00\x2C\x23\x5F\x00\x05\x02\x08":
+        return VertexAttribute("uv3", offset, "float16", 2, descriptor)
     return None
 
 
@@ -501,11 +627,13 @@ def _parse_faces(
     vertex_count: int,
     warnings: list[str],
     mesh_index: int,
+    platform: str = "ps3",
 ) -> np.ndarray:
     if resource.size < 0:
         raise PSGDataError(f"invalid face buffer size {resource.size}")
 
-    index_count = _read_i32(data, resource.info_offset + 8, "face index count")
+    count_offset = resource.info_offset + (32 if platform == "xbx" else 8)
+    index_count = _read_i32(data, count_offset, "face index count")
     if index_count < 0:
         raise PSGDataError(f"invalid face index count {index_count}")
 
@@ -567,7 +695,14 @@ def _decode_interleaved(
         offset=buffer_offset + attribute.offset,
         strides=(stride, dtype.itemsize),
     )
-    return array.astype(np.float32, copy=True)
+    values = array.astype(np.float32, copy=True)
+    # Noesis normalizes integer vertex attributes (SHORT -> /32768,
+    # USHORT -> /65535) the same way as position buffers.
+    if attribute.data_type == "int16":
+        values /= np.float32(32768.0)
+    elif attribute.data_type == "uint16":
+        values /= np.float32(65535.0)
+    return values
 
 
 def _parse_bones(

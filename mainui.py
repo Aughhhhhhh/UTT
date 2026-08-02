@@ -7,7 +7,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import traceback
 from pathlib import Path
 
@@ -711,10 +710,11 @@ class MainWindow(QMainWindow):
         self.resolution.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         self.resolution.setValue(512)
         if self.platform == "xbx":
-            # genrx2 only produces valid RX2 files up to 256x256; larger
-            # inputs yield corrupt headers or no file at all.
-            self.resolution.setMaximum(256)
-            self.resolution.setValue(256)
+            # The built-in encoder handles the X360 tiled layout itself and
+            # supports up to 4096x4096 (the RX2 size field stores width-1 /
+            # height-1 as 13-bit values).
+            self.resolution.setMaximum(4096)
+            self.resolution.setValue(512)
         resolution_row = QHBoxLayout()
         self.resolution_down = QPushButton("↓")
         self.resolution_down.setObjectName("resolutionButton")
@@ -747,10 +747,6 @@ class MainWindow(QMainWindow):
         self.convert_opacity_text.setObjectName("convertDescription")
         opacity_row.addWidget(self.convert_opacity_text)
         controls_layout.addLayout(opacity_row)
-        if self.platform == "xbx":
-            for widget in (opacity_row.itemAt(0).widget(),
-                           self.convert_opacity, self.convert_opacity_text):
-                widget.setVisible(False)
 
         output_row = QHBoxLayout()
         output_row.setSpacing(12)
@@ -1170,12 +1166,6 @@ class MainWindow(QMainWindow):
             return
         if isinstance(alias, tuple) and alias[0] == "psg_model":
             path = Path(alias[1])
-            if path.suffix.lower() == ".rx2":
-                self.model_preview.clear(
-                    "RX2 model preview is not supported yet.\n"
-                    "Xbox 360 models require a Noesis exporter plugin."
-                )
-                return
             self.current_model_path = path
             self.model_preview.show_loading(path)
             self._start_worker(
@@ -1616,7 +1606,8 @@ class MainWindow(QMainWindow):
         if self.platform == "xbx":
             self._start_worker(
                 lambda: self._convert_image_rx2(
-                    source, folder, alias, self.resolution.value()
+                    source, folder, alias, self.resolution.value(),
+                    self.convert_opacity.value() / 100,
                 ),
                 self._conversion_finished,
             )
@@ -1633,90 +1624,43 @@ class MainWindow(QMainWindow):
         )
 
     def _convert_image_rx2(self, source: str, folder: str, alias: str,
-                           resolution: int = 512) -> str:
-        """Convert an image to an RX2 texture using the genrx2 pipeline.
+                           resolution: int = 512, opacity: float = 1.0) -> str:
+        """Convert an image to an RX2 texture with the built-in encoder.
 
-        genrx2 runs with the bundled tools (genrx2.exe, Bundler.exe and the
-        example.rx2 template) copied into a scratch folder, emits output.rx2
-        there, then the file is renamed to the alias and moved to the output
-        folder. The texture is written at roughly 12% opacity for a subtler
-        in-game look.
+        The image is resized to a square power of two and encoded to a
+        tiled DXT5 mip chain in pure Python, using the bundled container
+        template (assets/rx2/container.rx2) for the header and file table.
+        The opacity slider scales the alpha channel (10-15% gives a subtle
+        in-game look on character textures).
         """
-        tools_dir = self.assets_dir / "genrx2"
-        required = [tools_dir / "genrx2.exe", tools_dir / "Bundler.exe",
-                    tools_dir / "example.rx2"]
-        for tool in required:
-            if not tool.is_file():
-                raise FileNotFoundError(
-                    f"Required tool not found: {tool}. "
-                    "Keep the assets folder next to UTT.exe."
-                )
+        container = self.assets_dir / "rx2" / "container.rx2"
+        if not container.is_file():
+            raise FileNotFoundError(
+                f"Container template not found: {container}. "
+                "Keep the assets folder next to UTT.exe."
+            )
         if not 16 <= resolution <= 4096:
             raise ValueError("Resolution must be between 16 and 4096")
-        if resolution > 256:
-            # genrx2 only produces valid files up to 256x256.
-            resolution = 256
+        resolution = 1 << (resolution.bit_length() - 1)
+        resolution = max(128, min(resolution, 4096))
+        opacity = max(0.0, min(1.0, opacity))
         output_path = Path(folder).resolve() / f"{alias}.rx2"
-        scratch = Path(tempfile.mkdtemp(prefix="utt_rx2_"))
-        try:
-            for tool in required:
-                target = scratch / tool.name
-                for _attempt in range(5):
-                    try:
-                        shutil.copy2(tool, target)
-                        break
-                    except PermissionError:
-                        time.sleep(0.3)
-                else:
-                    shutil.copy2(tool, target)
-            tga_path = scratch / "input.tga"
-            with Image.open(source) as image:
-                image = image.convert("RGBA")
-                image = image.resize(
-                    (resolution, resolution), Image.Resampling.LANCZOS
-                )
-                # genrx2 keeps the TGA alpha channel, and the in-game
-                # character texture blends best around 10-15% opacity.
-                image.putalpha(Image.new("L", image.size, 30))
-                image.save(tga_path, format="TGA")
-            result = subprocess.run(
-                [str(scratch / "genrx2.exe"), str(tga_path)],
-                cwd=str(scratch),
-                capture_output=True,
-                text=True,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        from rx2_parser import encode_rx2_texture
+        with Image.open(source) as image:
+            image = image.convert("RGBA")
+            image = image.resize(
+                (resolution, resolution), Image.Resampling.LANCZOS
             )
-            if result.returncode:
-                detail = (result.stdout or result.stderr).strip()
-                raise RuntimeError(
-                    "genrx2 failed" + (f": {detail}" if detail else
-                                       f" (exit code {result.returncode})")
+            if opacity < 1.0:
+                alpha = image.getchannel("A").point(
+                    lambda value: int(value * opacity)
                 )
-            generated = scratch / "output.rx2"
-            if not generated.is_file():
-                detail = (result.stdout or result.stderr).strip()
-                raise RuntimeError(
-                    "genrx2 finished without creating output.rx2"
-                    + (f" ({detail})" if detail else "")
-                    + " — note that genrx2 supports a maximum of 256x256."
-                )
-            # genrx2 leaves the game-layout format/size fields of the texture
-            # info block at zero, so external viewers report a 1x8 image;
-            # restore them before shipping the file.
-            from rx2_parser import patch_texture_entry
-            data = patch_texture_entry(generated.read_bytes(),
-                                       resolution, resolution)
-            generated.write_bytes(data)
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(generated, output_path)
-        finally:
-            # Antivirus may keep a handle on the copied tools for a moment,
-            # so retry the removal and never fail the conversion over it.
-            for _attempt in range(5):
-                if not scratch.exists():
-                    break
-                shutil.rmtree(scratch, ignore_errors=True)
-                time.sleep(0.5)
+                image.putalpha(alpha)
+            rgba = image.tobytes()
+        data = encode_rx2_texture(container.read_bytes(),
+                                  resolution, resolution, rgba)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_bytes(data)
         return str(output_path)
 
     def _conversion_finished(self, output):

@@ -11,15 +11,19 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
   `cache/data/content/createacharacter/model/cas_db`.
 - Preview PSG models with an interactive 3D viewer.
 - Convert images to PSG textures with resolution and opacity controls.
-- Convert images to RX2 textures for Xbox 360
-  (`assets/genrx2` pipeline, up to 256x256).
+- Convert images to RX2 textures for Xbox 360 with a built-in encoder
+  (pure-Python DXT5 + Xbox 360 tiled layout, up to 4096x4096) and the
+  same resolution and opacity controls as PSG.
+- Quick viewer: open any `.rx2` or `.psg` file with UTT (or right-click ->
+  Open with) to preview it fullscreen — textures and models for both
+  platforms, with model export to glTF/GLB.
 - Repack the edited cache to `cache/data/createacharacter.big`.
 - Live character scan for PS3: read the current character's models and
   textures from RPCS3 memory and preview them (saved to `output/current_items.txt`).
 
 ## Install
 
-Download `UTT-Setup-1.1.4.exe` from the
+Download `UTT-Setup-1.1.5.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -77,8 +81,8 @@ Collaborators with write access can publish installers without the GitHub CLI:
    separate Git installation.
 3. Run `build_installer.bat`.
 4. Open the repository's **Releases** page and choose **Draft a new release**.
-5. Create a tag matching the version, such as `v1.1.4`, and attach
-   `build/installer/UTT-Setup-1.1.4.exe`.
+5. Create a tag matching the version, such as `v1.1.5`, and attach
+   `build/installer/UTT-Setup-1.1.5.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release

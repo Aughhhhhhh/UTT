@@ -1,5 +1,5 @@
 #define AppName "UTT"
-#define AppVersion "1.1.4"
+#define AppVersion "1.1.5"
 #define AppExeName "UTT.exe"
 
 [Setup]
@@ -42,6 +42,19 @@ Source: "build\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recurses
 [Icons]
 Name: "{group}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\UTT.ico"
 Name: "{autodesktop}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\UTT.ico"; Tasks: desktopicon
+
+[Registry]
+; Open .rx2 and .psg files with UTT's quick viewer on double-click.
+; (Windows 10/11 remember a user's "Open with" choice and keep using it;
+; the first time, use right-click -> Open with -> UTT to re-pick the app.)
+Root: HKCU; Subkey: "Software\Classes\.rx2"; ValueType: string; ValueName: ""; ValueData: "UTT.rx2"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\.psg"; ValueType: string; ValueName: ""; ValueData: "UTT.psg"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\UTT.rx2"; ValueType: string; ValueName: ""; ValueData: "UTT RX2 File"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\UTT.psg"; ValueType: string; ValueName: ""; ValueData: "UTT PSG File"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\UTT.rx2\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\UTT.exe,0"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\UTT.psg\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\UTT.exe,0"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\UTT.rx2\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\UTT.exe"" ""%1"""; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\UTT.psg\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\UTT.exe"" ""%1"""; Flags: uninsdeletevalue
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch UTT"; Flags: nowait postinstall skipifsilent
