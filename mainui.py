@@ -15,11 +15,11 @@ from PIL.ImageQt import ImageQt
 from PyQt6.QtCore import QEvent, QObject, QRegularExpression, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QPixmap, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGraphicsBlurEffect,
-    QGridLayout, QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressDialog, QPushButton, QSizePolicy, QSlider, QSpinBox,
-    QSplitter, QStackedWidget, QTabWidget, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget,
+    QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
+    QGraphicsBlurEffect, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog,
+    QPushButton, QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget,
+    QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import recipe
@@ -31,11 +31,12 @@ from psg_converter import PSGConverter
 from PSGTx import PSGTx
 
 
-APP_TITLE = "UTT — rx2/psg tool"
+APP_TITLE = "UTT — Ultimate Texture Toolkit"
 
 CREDITS_TEXT = (
     "Credits\n\n"
-    "duckyinnit — everything\n"
+    "duckyinnit — had the idea\n"
+    "ai — everything\n"
     "itsclaudeya — model viewer\n"
     "Salix — Get Current Models And Textures\n"
     "S4M — PSG Converter\n"
@@ -109,6 +110,12 @@ class Worker(QObject):
             self.finished.emit(self.task())
         except Exception:
             self.failed.emit(traceback.format_exc())
+
+
+class LogEmitter(QObject):
+    """Thread-safe bridge for worker logs: emitting from any thread delivers
+    the line to the UI thread through the queued signal."""
+    log_line = pyqtSignal(str)
 
 
 class ImageDropZone(QLabel):
@@ -539,6 +546,7 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._make_convert_tab(), "Convert")
         if self.platform == "ps3":
             self.tabs.addTab(self._make_character_tab(), "Character")
+        self.tabs.addTab(self._make_glb_tab(), f"GLB to {self.platform_info['label']}")
         shell_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(shell)
 
@@ -773,6 +781,99 @@ class MainWindow(QMainWindow):
 
         return page
 
+    def _make_glb_tab(self) -> QWidget:
+        """Convert a GLB/glTF model into a game-ready {psg,rx2} mesh by
+        patching a donor template from the game."""
+        label = self.platform_info["label"]
+        extension = self.platform_info["extension"]
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(32, 24, 32, 24)
+        layout.setSpacing(14)
+
+        heading = QLabel(f"GLB/glTF to {label}")
+        heading.setObjectName("convertTitle")
+        heading.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(heading)
+        description = QLabel(
+            f"Choose a GLB or glTF model and a donor {extension} template, "
+            f"then convert it to a game-ready {label} file."
+        )
+        description.setObjectName("convertDescription")
+        description.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(description)
+
+        controls = QFrame()
+        controls.setObjectName("card")
+        controls_layout = QVBoxLayout(controls)
+        controls_layout.setContentsMargins(20, 16, 20, 16)
+        controls_layout.setSpacing(14)
+
+        glb_row = QHBoxLayout()
+        glb_row.setSpacing(14)
+        glb_btn = QPushButton("Select GLB/glTF…")
+        glb_btn.clicked.connect(self._choose_glb_file)
+        glb_row.addWidget(glb_btn)
+        self.glb_file_label = QLabel("No model selected")
+        self.glb_file_label.setObjectName("selectedImagePath")
+        self.glb_file_label.setWordWrap(True)
+        glb_row.addWidget(self.glb_file_label, 1)
+
+        donor_row = QHBoxLayout()
+        donor_row.setSpacing(14)
+        donor_btn = QPushButton(f"Select donor {label} template…")
+        donor_btn.clicked.connect(self._choose_glb_donor)
+        donor_row.addWidget(donor_btn)
+        self.glb_donor_label = QLabel(f"No donor {label} selected")
+        self.glb_donor_label.setObjectName("selectedImagePath")
+        self.glb_donor_label.setWordWrap(True)
+        donor_row.addWidget(self.glb_donor_label, 1)
+        controls_layout.addLayout(glb_row)
+        controls_layout.addLayout(donor_row)
+
+        output_row = QHBoxLayout()
+        output_row.setSpacing(12)
+        output_row.addWidget(QLabel("Output file"))
+        self.glb_output_input = QLineEdit(str(self.output_dir))
+        self.glb_output_input.setToolTip(
+            f"The converted {label} file will be written to this path."
+        )
+        output_row.addWidget(self.glb_output_input, 1)
+        browse_btn = QPushButton("Browse…")
+        browse_btn.clicked.connect(self._choose_glb_output)
+        output_row.addWidget(browse_btn)
+        controls_layout.addLayout(output_row)
+
+        scale_row = QHBoxLayout()
+        scale_row.setSpacing(12)
+        scale_row.addWidget(QLabel("Vertex scale"))
+        self.glb_scale = QDoubleSpinBox()
+        self.glb_scale.setRange(1.0, 100000.0)
+        self.glb_scale.setDecimals(1)
+        self.glb_scale.setValue(256.0)
+        self.glb_scale.setSingleStep(1.0)
+        self.glb_scale.setToolTip(
+            "Multiplier applied to vertex XYZ when packing to the game's "
+            "fixed-point format (256.0 is the default scale)."
+        )
+        scale_row.addWidget(self.glb_scale, 1)
+        controls_layout.addLayout(scale_row)
+
+        self.glb_convert_button = QPushButton(f"Convert GLB to {label}")
+        self.glb_convert_button.setObjectName("convertButton")
+        self.glb_convert_button.setEnabled(False)
+        self.glb_convert_button.clicked.connect(self._convert_glb)
+        controls_layout.addWidget(self.glb_convert_button)
+        layout.addWidget(controls)
+
+        self.glb_log = QPlainTextEdit()
+        self.glb_log.setObjectName("glbLog")
+        self.glb_log.setReadOnly(True)
+        self.glb_log.setPlaceholderText("Conversion log will appear here…")
+        layout.addWidget(self.glb_log, 1)
+
+        return page
+
     def _make_character_tab(self) -> QWidget:
         """Live Skate 3 character items: read the recipe from RPCS3 memory and
         preview the worn models/textures from the local cache."""
@@ -869,7 +970,7 @@ class MainWindow(QMainWindow):
             QPushButton { background: @accent; border: 0; border-radius: 16px; padding: 9px 16px; font-weight: 600; }
             QPushButton:hover { background: @accent_hover; }
             QPushButton:disabled { background: #45474b; color: #9aa0a6; }
-            QLineEdit, QTreeWidget, QSpinBox { background: #2b2c2f; border: 1px solid #4a4d52; border-radius: 9px; padding: 7px; }
+            QLineEdit, QTreeWidget, QSpinBox, QDoubleSpinBox { background: #2b2c2f; border: 1px solid #4a4d52; border-radius: 9px; padding: 7px; }
             QTreeWidget::item { padding: 5px; border-radius: 6px; }
             QTreeWidget::item:selected { background: @accent_dark; }
             QLabel#preview { background: #18191b; border: 1px dashed #5f6368; border-radius: 16px; }
@@ -885,6 +986,7 @@ class MainWindow(QMainWindow):
             QLineEdit#aliasInput { font-family: Consolas; font-size: 16px; padding: 10px; }
             QPushButton#resolutionButton { font-size: 21px; padding: 5px 10px; }
             QPushButton#convertButton { font-size: 16px; padding: 12px 18px; }
+            QPlainTextEdit#glbLog { background: #18191b; border: 1px solid #3c4043; border-radius: 12px; font-family: Consolas; font-size: 12px; padding: 8px; }
             QSlider::groove:horizontal { height: 7px; background: #4a4d52; border-radius: 3px; }
             QSlider::sub-page:horizontal { background: @accent_soft; border-radius: 3px; }
             QSlider::handle:horizontal { width: 18px; margin: -6px 0; background: #d2e3fc; border-radius: 9px; }
@@ -1548,6 +1650,91 @@ class MainWindow(QMainWindow):
         )
         if folder:
             self.convert_output_input.setText(os.path.normpath(folder))
+
+    def _choose_glb_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a GLB/glTF model", "",
+            "GLB/glTF models (*.glb *.gltf);;All files (*.*)",
+        )
+        if path:
+            self.glb_file_label.setText(Path(path).name)
+            self.glb_file_label.setToolTip(str(path))
+            output = self.glb_output_input.text().strip()
+            default_output = str(self.output_dir)
+            if not output or Path(output) == Path(default_output):
+                self.glb_output_input.setText(
+                    str(self.output_dir / f"{Path(path).stem}.{self.psg_extension}")
+                )
+            self._update_glb_ready()
+
+    def _choose_glb_donor(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose a donor template", "",
+            f"{self.platform_info['label']} files (*.{self.psg_extension});;All files (*.*)",
+        )
+        if path:
+            self.glb_donor_label.setText(Path(path).name)
+            self.glb_donor_label.setToolTip(str(path))
+            self._update_glb_ready()
+
+    def _choose_glb_output(self):
+        default = self.glb_output_input.text().strip() or str(
+            self.output_dir / f"converted.{self.psg_extension}"
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Choose output file", default,
+            f"{self.platform_info['label']} files (*.{self.psg_extension});;All files (*.*)",
+        )
+        if path:
+            self.glb_output_input.setText(os.path.normpath(path))
+
+    def _update_glb_ready(self):
+        self.glb_convert_button.setEnabled(bool(
+            self.glb_file_label.toolTip()
+            and self.glb_donor_label.toolTip()
+            and self.glb_output_input.text().strip()
+        ))
+
+    def _convert_glb(self):
+        glb_path = self.glb_file_label.toolTip()
+        donor_path = self.glb_donor_label.toolTip()
+        output_path = self.glb_output_input.text().strip()
+        if not (glb_path and donor_path and output_path):
+            self._show_error("Choose a model, a donor template and an output file.")
+            return
+        scale = self.glb_scale.value()
+        self.glb_convert_button.setEnabled(False)
+        self.glb_log.clear()
+
+        emitter = LogEmitter()
+        emitter.log_line.connect(self.glb_log.appendPlainText)
+
+        if self.platform == "xbx":
+            from rx2_glb_converter import convert_glb_to_rx2
+            def task():
+                return convert_glb_to_rx2(
+                    glb_path, donor_path, output_path,
+                    scale_xyz=scale, log=emitter.log_line.emit,
+                )
+        else:
+            from psg_glb_converter import convert_glb_to_psg
+            def task():
+                return convert_glb_to_psg(
+                    glb_path, donor_path, output_path,
+                    scale_xyz=scale, log=emitter.log_line.emit,
+                )
+
+        def done(result):
+            self._update_glb_ready()
+            QMessageBox.information(
+                self, APP_TITLE,
+                f"{self.platform_info['label']} created:\n{result.output_path}\n\n"
+                f"{result.vertex_count} vertices | {result.face_count} faces\n"
+                f"Skinned: {'yes' if result.skinned else 'no'} | "
+                f"Bones: {result.bone_count} | {result.file_size} bytes",
+            )
+
+        self._start_worker(task, done)
 
     def _choose_image(self):
         path, _ = QFileDialog.getOpenFileName(

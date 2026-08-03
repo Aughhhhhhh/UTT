@@ -2,3 +2,4 @@ matplotlib>=3.8
 numpy>=1.26
 Pillow>=10.0
 PyQt6>=6.6
+pygltflib>=1.16

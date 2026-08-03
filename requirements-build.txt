@@ -4,4 +4,5 @@ matplotlib>=3.8
 PyQt6>=6.6
 Pymem==1.14.0
 S3RecipeHandler==1.2.0
+pygltflib>=1.16
 PyInstaller>=6.0,<7

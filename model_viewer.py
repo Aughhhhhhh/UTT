@@ -23,6 +23,80 @@ from mdl_parser import Mesh, PSGModel
 MAX_VIEWPORT_TRIANGLES = 200_000
 INTERACTION_TRIANGLES = 50_000
 SUBDIVISION_TRIANGLE_LIMIT = 50_000
+DISPLAY_TRIANGLE_BUDGET = INTERACTION_TRIANGLES
+
+
+def _decimate_mesh(mesh: Mesh, target_triangles: int) -> Mesh:
+    """Display-only vertex-clustering decimation: merge vertices that land in
+    the same grid cell, then drop faces that collapse. Never called on the
+    export model — only on preview copies."""
+    if (
+        mesh.triangle_count == 0
+        or mesh.vertex_count == 0
+        or mesh.triangle_count <= target_triangles
+    ):
+        return mesh
+
+    verts = mesh.vertices
+    lo = verts.min(axis=0)
+    span = np.maximum(verts.max(axis=0) - lo, 1e-9)
+    if not np.isfinite(span).all() or float(span.max()) <= 1e-12:
+        return mesh
+
+    cells_per_axis = max(2, int(round(float(np.cbrt(target_triangles)))))
+    cell = np.floor((verts - lo) / span * cells_per_axis).astype(np.int64)
+    cell = np.clip(cell, 0, cells_per_axis - 1)
+    cell_id = (
+        cell[:, 0] * (cells_per_axis * cells_per_axis)
+        + cell[:, 1] * cells_per_axis
+        + cell[:, 2]
+    )
+    _, first_idx, inverse = np.unique(
+        cell_id, return_index=True, return_inverse=True
+    )
+
+    merged_verts = np.zeros((len(first_idx), 3), dtype=np.float64)
+    np.add.at(merged_verts, inverse, verts)
+    counts = np.bincount(inverse, minlength=len(first_idx)).astype(np.float64)
+    merged_verts /= counts[:, None]
+
+    new_faces = inverse[mesh.faces]
+    valid = (
+        (new_faces[:, 0] != new_faces[:, 1])
+        & (new_faces[:, 1] != new_faces[:, 2])
+        & (new_faces[:, 0] != new_faces[:, 2])
+    )
+    new_faces = new_faces[valid]
+    if new_faces.shape[0] == 0:
+        return mesh
+
+    merged_normals = None
+    if mesh.normals is not None:
+        normals = np.zeros((len(first_idx), 3), dtype=np.float64)
+        np.add.at(normals, inverse, mesh.normals)
+        normals /= counts[:, None]
+        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
+        normals = normals / np.maximum(lengths, 1e-9)
+        merged_normals = normals.astype(np.float32)
+
+    merged_uvs = None
+    if mesh.uvs is not None:
+        uvs = np.zeros((len(first_idx), 2), dtype=np.float64)
+        np.add.at(uvs, inverse, mesh.uvs)
+        uvs /= counts[:, None]
+        merged_uvs = uvs.astype(np.float32)
+
+    return Mesh(
+        name=mesh.name,
+        vertices=merged_verts.astype(np.float32),
+        faces=new_faces.astype(np.uint32),
+        uvs=merged_uvs,
+        normals=merged_normals,
+        material_name=mesh.material_name,
+        vertex_stride=mesh.vertex_stride,
+        attributes=mesh.attributes,
+        source_offsets=mesh.source_offsets,
+    )
 
 
 def _subdivide_mesh(mesh: Mesh) -> Mesh:
@@ -81,6 +155,7 @@ class ModelPreview(QWidget):
         super().__init__(parent)
         self.model: PSGModel | None = None
         self.path: Path | None = None
+        self._display_meshes: list[Mesh] = []
         self._full_artists = []
         self._interaction_artists = []
         self._interactive_lod_active = False
@@ -139,6 +214,7 @@ class ModelPreview(QWidget):
 
     def show_loading(self, path: Path) -> None:
         self.model = None
+        self._display_meshes = []
         self.path = path
         self.title_label.setText(path.name)
         self.details_label.setText("Parsing model…")
@@ -148,6 +224,7 @@ class ModelPreview(QWidget):
 
     def clear(self, message: str = "No model loaded") -> None:
         self.model = None
+        self._display_meshes = []
         self.path = None
         self.title_label.setText("Select a model to preview")
         self.details_label.setText("")
@@ -157,10 +234,10 @@ class ModelPreview(QWidget):
 
     def set_model(self, path: Path, model: PSGModel) -> None:
         self.path = path
-        original_count = model.triangle_count
         self._subdivide_meshes(model)
         subdivided_count = model.triangle_count
         self.model = model
+        self._display_meshes = self._decimate_for_display(model)
         self.title_label.setText(path.name)
         self.details_label.setText(
             f"{len(model.meshes):,} meshes  •  {model.vertex_count:,} vertices  •  "
@@ -171,11 +248,12 @@ class ModelPreview(QWidget):
         self.export_btn.setEnabled(True)
         self.redraw_model(reset_camera=True)
 
-        shown = min(model.triangle_count, MAX_VIEWPORT_TRIANGLES)
+        display_triangles = sum(m.triangle_count for m in self._display_meshes)
+        shown = min(display_triangles, MAX_VIEWPORT_TRIANGLES)
         parts = []
-        if original_count != subdivided_count:
-            parts.append(f"subdivided to {model.triangle_count:,}")
-        if shown < model.triangle_count:
+        if display_triangles < subdivided_count:
+            parts.append(f"preview reduced to {display_triangles:,}")
+        if shown < display_triangles:
             parts.append(f"showing {shown:,}")
         label = "  •  ".join(parts)
         base = "Click and drag to rotate  •  Mouse wheel to zoom"
@@ -187,6 +265,19 @@ class ModelPreview(QWidget):
     def _subdivide_meshes(model: PSGModel) -> None:
         for i in range(len(model.meshes)):
             model.meshes[i] = _subdivide_mesh(model.meshes[i])
+
+    @staticmethod
+    def _decimate_for_display(model: PSGModel) -> list[Mesh]:
+        """Build low-poly copies for the preview only — the export model is
+        never touched. Triangles are split proportionally across meshes."""
+        total = max(1, sum(m.triangle_count for m in model.meshes))
+        display_meshes: list[Mesh] = []
+        for mesh in model.meshes:
+            target = max(
+                256, int(DISPLAY_TRIANGLE_BUDGET * mesh.triangle_count / total)
+            )
+            display_meshes.append(_decimate_mesh(mesh, target))
+        return display_meshes
 
     def _on_export(self) -> None:
         if self.model is not None:
@@ -225,11 +316,14 @@ class ModelPreview(QWidget):
             scale = 1.0
 
         remaining_budget = MAX_VIEWPORT_TRIANGLES
-        remaining_triangles = max(1, self.model.triangle_count)
+        display_triangles = max(
+            1, sum(m.triangle_count for m in self._display_meshes)
+        )
+        remaining_triangles = display_triangles
         interaction_remaining_budget = INTERACTION_TRIANGLES
         interaction_remaining_triangles = remaining_triangles
-        use_interaction_lod = self.model.triangle_count > INTERACTION_TRIANGLES
-        for mesh_index, mesh in enumerate(self.model.meshes):
+        use_interaction_lod = display_triangles > INTERACTION_TRIANGLES
+        for mesh_index, mesh in enumerate(self._display_meshes):
             if mesh.vertex_count == 0:
                 continue
 

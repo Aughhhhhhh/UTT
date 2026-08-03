@@ -30,6 +30,9 @@ python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name UTT
   --hidden-import pymem ^
   --hidden-import S3RecipeHandler ^
   --hidden-import rx2_parser ^
+  --hidden-import psg_glb_converter ^
+  --hidden-import rx2_glb_converter ^
+  --hidden-import pygltflib ^
   --add-data "%CD%\psg_list.json;." ^
   --add-data "%CD%\UTT.ico;." ^
   --add-data "%CD%\xbx.png;." ^

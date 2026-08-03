@@ -148,7 +148,7 @@ class QuickFileViewer(QMainWindow):
         accent = "#107c10" if self.opened_path.suffix.lower() == ".rx2" else "#5b86e5"
         self._apply_style(accent)
 
-        self.setWindowTitle("UTT — rx2/psg viewer")
+        self.setWindowTitle("UTT — Ultimate Texture Toolkit")
         self.resize(980, 620)
 
         central = QWidget(self)
