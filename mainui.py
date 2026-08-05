@@ -12,7 +12,7 @@ from pathlib import Path
 
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PyQt6.QtCore import QEvent, QObject, QRegularExpression, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QRect, QRegularExpression, Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QPixmap, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
@@ -234,9 +234,18 @@ class TitleBar(QFrame):
         return button
 
     def sync_maximized(self):
-        maximized = self.window.isMaximized()
-        self.maximize_button.setText("❐" if maximized else "□")
-        self.maximize_button.setToolTip("Restore" if maximized else "Maximize")
+        screen = self.window.screen() or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+        margin = 2
+        fill_rect = QRect(
+            available.left() + margin,
+            available.top() + margin,
+            available.width() - margin * 2,
+            available.height() - margin * 2,
+        )
+        filled = self.window.geometry() == fill_rect
+        self.maximize_button.setText("❐" if filled else "□")
+        self.maximize_button.setToolTip("Restore" if filled else "Maximize")
 
     def mouseDoubleClickEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
@@ -524,6 +533,7 @@ class MainWindow(QMainWindow):
         )
         self.resize(1200, 760)
         self.setMinimumSize(900, 600)
+        self._normal_geometry = QRect(120, 80, 1200, 760)
         self._build_ui()
         self._apply_style()
         self._load_catalog()
@@ -546,7 +556,6 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._make_convert_tab(), "Convert")
         if self.platform == "ps3":
             self.tabs.addTab(self._make_character_tab(), "Character")
-        self.tabs.addTab(self._make_glb_tab(), f"GLB to {self.platform_info['label']}")
         shell_layout.addWidget(self.tabs, 1)
         self.setCentralWidget(shell)
 
@@ -658,6 +667,36 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(32, 24, 32, 24)
+        layout.setSpacing(14)
+
+        mode_row = QHBoxLayout()
+        mode_row.addStretch(1)
+        mode_row.addWidget(QLabel("Convert"))
+        self.convert_mode = QComboBox()
+        self.convert_mode.addItem("Textures", "textures")
+        self.convert_mode.addItem(
+            f"GLB/glTF to {self.platform_info['label']}", "glb"
+        )
+        self.convert_mode.currentIndexChanged.connect(self._refresh_convert_mode)
+        mode_row.addWidget(self.convert_mode)
+        mode_row.addStretch(1)
+        layout.addLayout(mode_row)
+
+        self.convert_stack = QStackedWidget()
+        self.convert_stack.addWidget(self._make_texture_convert_page())
+        self.convert_stack.addWidget(self._make_glb_page())
+        layout.addWidget(self.convert_stack, 1)
+
+        return page
+
+    def _refresh_convert_mode(self):
+        mode = self.convert_mode.currentData()
+        self.convert_stack.setCurrentIndex(1 if mode == "glb" else 0)
+
+    def _make_texture_convert_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
         heading = QLabel(f"Image to {self.platform_info['label']}")
@@ -781,14 +820,14 @@ class MainWindow(QMainWindow):
 
         return page
 
-    def _make_glb_tab(self) -> QWidget:
+    def _make_glb_page(self) -> QWidget:
         """Convert a GLB/glTF model into a game-ready {psg,rx2} mesh by
         patching a donor template from the game."""
         label = self.platform_info["label"]
         extension = self.platform_info["extension"]
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(32, 24, 32, 24)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(14)
 
         heading = QLabel(f"GLB/glTF to {label}")
@@ -1011,12 +1050,44 @@ class MainWindow(QMainWindow):
 
         with catalog_path.open("r", encoding="utf-8") as file:
             catalog = json.load(file)
+        search = self.search_box.text().strip().lower()
         self.texture_tree.clear()
         # Before an archive is chosen we show the full reference catalog. Once
         # a cache exists, IDs without a matching PSG are omitted entirely.
         self._add_catalog_nodes(
-            self.texture_tree, catalog, bool(self.psg_index), self.search_box.text().strip().lower()
+            self.texture_tree, catalog, bool(self.psg_index), search
         )
+        if search:
+            self._add_cache_search_results(search)
+
+    def _add_cache_search_results(self, search: str) -> None:
+        """Show cached files matching the search that are not in the JSON
+        catalog, so anything inside the cache can be found by its hex ID."""
+        shown = set()
+        root = self.texture_tree.invisibleRootItem()
+
+        def collect(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                data = child.data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(data, str):
+                    shown.add(data)
+                collect(child)
+
+        collect(root)
+        matches = sorted(
+            alias
+            for alias, paths in self.psg_index.items()
+            if search in alias and alias not in shown
+        )
+        if not matches:
+            return
+        node = QTreeWidgetItem(self.texture_tree, [
+            f"Other cache files ({len(matches)})"
+        ])
+        for alias in matches:
+            leaf = QTreeWidgetItem(node, [alias])
+            leaf.setData(0, Qt.ItemDataRole.UserRole, alias)
 
     def _refresh_browser_tree(self):
         mode = self.browser_mode.currentData()
@@ -1093,22 +1164,47 @@ class MainWindow(QMainWindow):
             item = QTreeWidgetItem(container, [name])
             show_all_children = parent_matches or (bool(search) and search in name.lower())
             if isinstance(child, dict):
-                if self._add_catalog_nodes(item, child, available_only, search, show_all_children):
-                    has_children = True
+                # When a folder holds a list with the same name as itself
+                # (e.g. Decks -> {"Decks": [...], "Plain Color Boards": [...]}),
+                # inline that list into the folder instead of nesting a folder
+                # with the identical name.
+                same_name_list = child.get(name)
+                if isinstance(same_name_list, list):
+                    if self._add_alias_leaves(
+                        item, same_name_list, available_only, search, show_all_children
+                    ):
+                        has_children = True
+                    rest = {key: value2 for key, value2 in child.items() if key != name}
+                    if rest and self._add_catalog_nodes(
+                        item, rest, available_only, search, show_all_children
+                    ):
+                        has_children = True
+                    if item.childCount() == 0:
+                        container.removeChild(item)
                 else:
-                    container.removeChild(item)
+                    if self._add_catalog_nodes(item, child, available_only, search, show_all_children):
+                        has_children = True
+                    else:
+                        container.removeChild(item)
             else:
-                for alias in child:
-                    if available_only and alias.lower() not in self.psg_index:
-                        continue
-                    if search and not show_all_children and search not in alias.lower():
-                        continue
-                    leaf = QTreeWidgetItem(item, [alias])
-                    leaf.setData(0, Qt.ItemDataRole.UserRole, alias.lower())
+                if self._add_alias_leaves(item, child, available_only, search, show_all_children):
                     has_children = True
                 if item.childCount() == 0:
                     container.removeChild(item)
         return has_children
+
+    def _add_alias_leaves(self, item, aliases, available_only: bool, search: str,
+                          show_all_children: bool) -> bool:
+        added = False
+        for alias in aliases:
+            if available_only and alias.lower() not in self.psg_index:
+                continue
+            if search and not show_all_children and search not in alias.lower():
+                continue
+            leaf = QTreeWidgetItem(item, [alias])
+            leaf.setData(0, Qt.ItemDataRole.UserRole, alias.lower())
+            added = True
+        return added
 
     def _request_archive(self):
         picker = ArchivePicker(self, self.platform)
@@ -1125,7 +1221,7 @@ class MainWindow(QMainWindow):
         message = (
             "Repack every file under cache\\data into:\n\n"
             f"{target_path}\n\n"
-            "This can take several minutes."
+            "Files are packed without compression for speed."
         )
         if target_path.exists():
             message += "\n\nThe existing repacked archive will be replaced."
@@ -1456,9 +1552,6 @@ class MainWindow(QMainWindow):
             part.addChild(texture)
             self.character_tree.addTopLevelItem(part)
         self.character_open_button.setEnabled(True)
-        if self.character_tree.topLevelItemCount():
-            first = self.character_tree.topLevelItem(0)
-            self.character_tree.setCurrentItem(first.child(0) if first.childCount() else first)
 
     def _load_saved_character_items(self):
         """Reuse the previous scan when output\\current_items.txt exists."""
@@ -1973,10 +2066,27 @@ class MainWindow(QMainWindow):
         self.close()
 
     def _toggle_maximized(self):
-        if self.isMaximized():
-            self.showNormal()
+        """Fill the screen while staying a window.
+
+        Real maximize makes the frameless window cover the entire monitor,
+        which NVIDIA treats as borderless fullscreen and pops its overlay over
+        the app. Leaving a small visible desktop edge keeps the window
+        classified as a window so the overlay never appears.
+        """
+        screen = self.screen() or QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+        margin = 2
+        fill_rect = QRect(
+            available.left() + margin,
+            available.top() + margin,
+            available.width() - margin * 2,
+            available.height() - margin * 2,
+        )
+        if self.geometry() == fill_rect:
+            self.setGeometry(self._normal_geometry)
         else:
-            self.showMaximized()
+            self._normal_geometry = self.geometry()
+            self.setGeometry(fill_rect)
 
     def changeEvent(self, event):
         super().changeEvent(event)

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import subprocess
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -18,12 +17,19 @@ class ArchiveManager:
     def __init__(self, bigfile_path: str | Path):
         self.bigfile_path = Path(bigfile_path).resolve()
 
-    def repack(self, cache_dir: str | Path) -> RepackResult:
+    def repack(
+        self,
+        cache_dir: str | Path,
+        compression: int = 0,
+    ) -> RepackResult:
         if not self.bigfile_path.is_file():
             raise FileNotFoundError(
                 f"Required tool not found: {self.bigfile_path}. "
                 "Keep the assets folder next to UTT.exe."
             )
+
+        if not 0 <= int(compression) <= 4:
+            raise ValueError("compression must be between 0 (none) and 4 (LZX)")
 
         cache_path = Path(cache_dir).resolve()
         data_path = cache_path / "data"
@@ -42,12 +48,9 @@ class ArchiveManager:
         if not files:
             raise RuntimeError("The cache data folder does not contain any files to pack")
 
-        with tempfile.TemporaryDirectory(
-            prefix=".utt_repack_", dir=cache_path
-        ) as temp_dir:
-            temp_path = Path(temp_dir)
-            response_path = temp_path / "files.rsp"
-            output_path = temp_path / "createacharacter.big"
+        response_path = cache_path / ".utt_repack_files.rsp"
+        staging_path = data_path / "createacharacter.big.new"
+        try:
             response_path.write_text(
                 "\n".join(
                     f'"{path.relative_to(cache_path)}"' for path in files
@@ -58,22 +61,20 @@ class ArchiveManager:
             self._run(
                 [
                     str(self.bigfile_path),
-                    str(output_path),
-                    "-compress1",
+                    str(staging_path),
+                    f"-compress{int(compression)}",
                     "-fat",
                     f"@{response_path}",
                 ],
                 cache_path,
             )
-            if not output_path.is_file() or output_path.stat().st_size == 0:
+            if not staging_path.is_file() or staging_path.stat().st_size == 0:
                 raise RuntimeError("bigfile.exe finished without creating an archive")
 
-            self._run(
-                [str(self.bigfile_path), str(output_path), "-l"],
-                cache_path,
-            )
-            data_path.mkdir(parents=True, exist_ok=True)
-            os.replace(output_path, target_path)
+            os.replace(staging_path, target_path)
+        finally:
+            staging_path.unlink(missing_ok=True)
+            response_path.unlink(missing_ok=True)
 
         return RepackResult(
             path=target_path,

@@ -1,6 +1,5 @@
 Pillow>=10.0
 numpy>=1.26
-matplotlib>=3.8
 PyQt6>=6.6
 Pymem==1.14.0
 S3RecipeHandler==1.2.0

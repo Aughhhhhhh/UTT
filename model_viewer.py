@@ -3,10 +3,16 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
-from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
-from matplotlib.figure import Figure
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QMatrix4x4, QPainter, QSurfaceFormat, QVector3D
+from PyQt6.QtOpenGL import (
+    QOpenGLBuffer,
+    QOpenGLFunctions_2_0,
+    QOpenGLShader,
+    QOpenGLShaderProgram,
+    QOpenGLVertexArrayObject,
+)
+from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (
     QCheckBox,
     QHBoxLayout,
@@ -19,84 +25,49 @@ from PyQt6.QtWidgets import (
 
 from mdl_parser import Mesh, PSGModel
 
+# OpenGL constants (PyQt6 does not export the GL_* enums)
+_GL_COLOR_BUFFER_BIT = 0x4000
+_GL_DEPTH_BUFFER_BIT = 0x0100
+_GL_DEPTH_TEST = 0x0B71
+_GL_FRONT_AND_BACK = 0x0408
+_GL_FILL = 0x1B02
+_GL_LINE = 0x1B01
+_GL_TRIANGLES = 0x0004
+_GL_POINTS = 0x0000
+_GL_UNSIGNED_INT = 0x1405
+_GL_FLOAT = 0x1406
 
-MAX_VIEWPORT_TRIANGLES = 200_000
-INTERACTION_TRIANGLES = 50_000
 SUBDIVISION_TRIANGLE_LIMIT = 50_000
-DISPLAY_TRIANGLE_BUDGET = INTERACTION_TRIANGLES
 
+_VERTEX_SHADER = """
+#version 120
+attribute vec3 a_position;
+attribute vec3 a_normal;
+uniform mat4 u_mvp;
+varying vec3 v_normal;
+void main() {
+    v_normal = a_normal;
+    gl_Position = u_mvp * vec4(a_position, 1.0);
+}
+"""
 
-def _decimate_mesh(mesh: Mesh, target_triangles: int) -> Mesh:
-    """Display-only vertex-clustering decimation: merge vertices that land in
-    the same grid cell, then drop faces that collapse. Never called on the
-    export model — only on preview copies."""
-    if (
-        mesh.triangle_count == 0
-        or mesh.vertex_count == 0
-        or mesh.triangle_count <= target_triangles
-    ):
-        return mesh
-
-    verts = mesh.vertices
-    lo = verts.min(axis=0)
-    span = np.maximum(verts.max(axis=0) - lo, 1e-9)
-    if not np.isfinite(span).all() or float(span.max()) <= 1e-12:
-        return mesh
-
-    cells_per_axis = max(2, int(round(float(np.cbrt(target_triangles)))))
-    cell = np.floor((verts - lo) / span * cells_per_axis).astype(np.int64)
-    cell = np.clip(cell, 0, cells_per_axis - 1)
-    cell_id = (
-        cell[:, 0] * (cells_per_axis * cells_per_axis)
-        + cell[:, 1] * cells_per_axis
-        + cell[:, 2]
-    )
-    _, first_idx, inverse = np.unique(
-        cell_id, return_index=True, return_inverse=True
-    )
-
-    merged_verts = np.zeros((len(first_idx), 3), dtype=np.float64)
-    np.add.at(merged_verts, inverse, verts)
-    counts = np.bincount(inverse, minlength=len(first_idx)).astype(np.float64)
-    merged_verts /= counts[:, None]
-
-    new_faces = inverse[mesh.faces]
-    valid = (
-        (new_faces[:, 0] != new_faces[:, 1])
-        & (new_faces[:, 1] != new_faces[:, 2])
-        & (new_faces[:, 0] != new_faces[:, 2])
-    )
-    new_faces = new_faces[valid]
-    if new_faces.shape[0] == 0:
-        return mesh
-
-    merged_normals = None
-    if mesh.normals is not None:
-        normals = np.zeros((len(first_idx), 3), dtype=np.float64)
-        np.add.at(normals, inverse, mesh.normals)
-        normals /= counts[:, None]
-        lengths = np.linalg.norm(normals, axis=1, keepdims=True)
-        normals = normals / np.maximum(lengths, 1e-9)
-        merged_normals = normals.astype(np.float32)
-
-    merged_uvs = None
-    if mesh.uvs is not None:
-        uvs = np.zeros((len(first_idx), 2), dtype=np.float64)
-        np.add.at(uvs, inverse, mesh.uvs)
-        uvs /= counts[:, None]
-        merged_uvs = uvs.astype(np.float32)
-
-    return Mesh(
-        name=mesh.name,
-        vertices=merged_verts.astype(np.float32),
-        faces=new_faces.astype(np.uint32),
-        uvs=merged_uvs,
-        normals=merged_normals,
-        material_name=mesh.material_name,
-        vertex_stride=mesh.vertex_stride,
-        attributes=mesh.attributes,
-        source_offsets=mesh.source_offsets,
-    )
+_FRAGMENT_SHADER = """
+#version 120
+varying vec3 v_normal;
+uniform vec3 u_light_dir;
+uniform vec3 u_tint;
+void main() {
+    vec3 n = normalize(v_normal);
+    if (!gl_FrontFacing) {
+        n = -n;
+    }
+    vec3 l = normalize(u_light_dir);
+    float ndl = clamp(dot(n, l), 0.0, 1.0);
+    float hemi = clamp(n.y * 0.5 + 0.5, 0.0, 1.0);
+    float intensity = 0.18 + 0.20 * hemi + 0.62 * pow(ndl, 0.8);
+    gl_FragColor = vec4(u_tint * intensity, 1.0);
+}
+"""
 
 
 def _subdivide_mesh(mesh: Mesh) -> Mesh:
@@ -148,6 +119,242 @@ def _subdivide_mesh(mesh: Mesh) -> Mesh:
     )
 
 
+class _MeshBuffers:
+    """GPU-side geometry for one mesh: interleaved vertices + indices."""
+
+    def __init__(self):
+        self.vao: QOpenGLVertexArrayObject | None = None
+        self.vbo: QOpenGLBuffer | None = None
+        self.ibo: QOpenGLBuffer | None = None
+        self.index_count = 0
+        self.vertex_count = 0
+        self.is_points = False
+        self.tint = (1.0, 1.0, 1.0)
+
+
+class _GlViewport(QOpenGLWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        fmt = QSurfaceFormat()
+        fmt.setVersion(2, 1)
+        fmt.setProfile(QSurfaceFormat.OpenGLContextProfile.CompatibilityProfile)
+        fmt.setDepthBufferSize(24)
+        self.setFormat(fmt)
+        self._meshes: list[tuple[np.ndarray, np.ndarray | None, float]] = []
+        self._buffers: list[_MeshBuffers] = []
+        self._needs_upload = False
+        self._message = ""
+        self._yaw = -55.0
+        self._pitch = 22.0
+        self._distance = 3.4
+        self._last_pos = None
+        self._wireframe = False
+        self._light_dir = np.array((0.35, -0.45, 0.82), dtype=np.float32)
+        self._light_dir /= np.linalg.norm(self._light_dir)
+        self._empty_program: QOpenGLShaderProgram | None = None
+
+    # ------------------------------------------------------------------ model
+
+    def set_meshes(self, meshes: list[Mesh]) -> None:
+        self._meshes = []
+        for index, mesh in enumerate(meshes):
+            if mesh.vertex_count == 0:
+                continue
+            positions = mesh.vertices.astype(np.float32)
+            if mesh.normals is not None:
+                normals = mesh.normals.astype(np.float32)
+            else:
+                normals = np.zeros_like(positions)
+            # interleave position + normal (stride 24 bytes)
+            interleaved = np.empty((len(positions), 6), dtype=np.float32)
+            interleaved[:, 0:3] = positions
+            interleaved[:, 3:6] = normals
+            tint = 1.0 + ((index % 3) - 1) * 0.06
+            faces = mesh.faces.astype(np.uint32) if mesh.triangle_count else None
+            self._meshes.append((interleaved, faces, tint))
+        self._needs_upload = True
+        self.update()
+
+    def set_message(self, message: str) -> None:
+        self._message = message
+        self._meshes = []
+        self._buffers = []
+        self._needs_upload = False
+        self.update()
+
+    def set_wireframe(self, enabled: bool) -> None:
+        self._wireframe = enabled
+        self.update()
+
+    def reset_camera(self) -> None:
+        self._yaw = -55.0
+        self._pitch = 22.0
+        self._distance = 3.4
+        self.update()
+
+    # ------------------------------------------------------------- GL setup
+
+    def initializeGL(self) -> None:
+        self._empty_program = QOpenGLShaderProgram(self)
+        self._empty_program.addShaderFromSourceCode(
+            QOpenGLShader.ShaderTypeBit.Vertex, _VERTEX_SHADER
+        )
+        self._empty_program.addShaderFromSourceCode(
+            QOpenGLShader.ShaderTypeBit.Fragment, _FRAGMENT_SHADER
+        )
+        self._empty_program.bindAttributeLocation("a_position", 0)
+        self._empty_program.bindAttributeLocation("a_normal", 1)
+        self._empty_program.link()
+        self._upload_meshes()
+
+    def _upload_meshes(self) -> None:
+        for buffer in self._buffers:
+            if buffer.vao is not None:
+                buffer.vao.destroy()
+        self._buffers = []
+        if not self._meshes:
+            return
+        gl = QOpenGLFunctions_2_0()
+        gl.initializeOpenGLFunctions()
+        for interleaved, faces, tint in self._meshes:
+            buffer = _MeshBuffers()
+            buffer.vertex_count = interleaved.shape[0]
+            buffer.is_points = faces is None
+            buffer.tint = (tint, tint, tint)
+            buffer.vao = QOpenGLVertexArrayObject(self)
+            buffer.vao.create()
+            buffer.vao.bind()
+            buffer.vbo = QOpenGLBuffer(QOpenGLBuffer.Type.VertexBuffer)
+            buffer.vbo.create()
+            buffer.vbo.bind()
+            buffer.vbo.allocate(interleaved.tobytes(), interleaved.nbytes)
+            self._empty_program.enableAttributeArray(0)
+            self._empty_program.setAttributeBuffer(
+                0, _GL_FLOAT, 0, 3, 6 * np.dtype(np.float32).itemsize
+            )
+            self._empty_program.enableAttributeArray(1)
+            self._empty_program.setAttributeBuffer(
+                1, _GL_FLOAT, 3 * np.dtype(np.float32).itemsize, 3,
+                6 * np.dtype(np.float32).itemsize,
+            )
+            if faces is not None:
+                buffer.ibo = QOpenGLBuffer(QOpenGLBuffer.Type.IndexBuffer)
+                buffer.ibo.create()
+                buffer.ibo.bind()
+                buffer.ibo.allocate(faces.tobytes(), faces.nbytes)
+                buffer.index_count = faces.shape[0] * 3
+            buffer.vao.release()
+            self._buffers.append(buffer)
+        self._needs_upload = False
+
+    # -------------------------------------------------------------- painting
+
+    def paintGL(self) -> None:
+        gl = QOpenGLFunctions_2_0()
+        gl.initializeOpenGLFunctions()
+        gl.glClearColor(0.094, 0.098, 0.106, 1.0)
+        gl.glClear(_GL_COLOR_BUFFER_BIT | _GL_DEPTH_BUFFER_BIT)
+
+        if self._needs_upload:
+            self._upload_meshes()
+
+        if not self._buffers:
+            if self._message:
+                painter = QPainter(self)
+                painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+                painter.setPen(QColor("#9aa0a6"))
+                painter.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, self._message)
+                painter.end()
+            return
+
+        gl.glEnable(_GL_DEPTH_TEST)
+        aspect = self.width() / max(1, self.height())
+        projection = QMatrix4x4()
+        projection.perspective(45.0, aspect, 0.05, 200.0)
+        rad_y = np.radians(self._yaw)
+        rad_p = np.radians(self._pitch)
+        eye_x = self._distance * np.cos(rad_p) * np.cos(rad_y)
+        eye_y = self._distance * np.sin(rad_p)
+        eye_z = self._distance * np.cos(rad_p) * np.sin(rad_y)
+        view = QMatrix4x4()
+        view.lookAt(
+            QVector3D(eye_x, eye_y, eye_z),
+            QVector3D(0.0, 0.0, 0.0),
+            QVector3D(0.0, 1.0, 0.0),
+        )
+        mvp = projection * view
+
+        if self._wireframe:
+            self._empty_program.bind()
+            self._empty_program.setUniformValue("u_mvp", mvp)
+            self._empty_program.setUniformValue(
+                "u_light_dir",
+                QVector3D(self._light_dir[0], self._light_dir[1], self._light_dir[2]),
+            )
+            gl.glPolygonMode(_GL_FRONT_AND_BACK, _GL_LINE)
+            gl.glLineWidth(1.0)
+            for buffer in self._buffers:
+                if buffer.is_points:
+                    continue
+                self._empty_program.setUniformValue(
+                    "u_tint",
+                    QVector3D(buffer.tint[0], buffer.tint[1], buffer.tint[2]),
+                )
+                self._draw_buffer(gl, buffer, mvp)
+            gl.glPolygonMode(_GL_FRONT_AND_BACK, _GL_FILL)
+        else:
+            self._empty_program.bind()
+            self._empty_program.setUniformValue("u_mvp", mvp)
+            self._empty_program.setUniformValue(
+                "u_light_dir",
+                QVector3D(self._light_dir[0], self._light_dir[1], self._light_dir[2]),
+            )
+            for buffer in self._buffers:
+                if buffer.is_points:
+                    gl.glPointSize(2.0)
+                self._empty_program.setUniformValue(
+                    "u_tint",
+                    QVector3D(buffer.tint[0], buffer.tint[1], buffer.tint[2]),
+                )
+                self._draw_buffer(gl, buffer, mvp)
+        gl.glDisable(_GL_DEPTH_TEST)
+
+    def _draw_buffer(self, gl, buffer: _MeshBuffers, mvp) -> None:
+        if buffer.vao is not None:
+            buffer.vao.bind()
+        if buffer.ibo is not None:
+            gl.glDrawElements(
+                _GL_TRIANGLES, buffer.index_count, _GL_UNSIGNED_INT, None
+            )
+        elif buffer.vertex_count:
+            gl.glDrawArrays(_GL_POINTS, 0, buffer.vertex_count)
+        if buffer.vao is not None:
+            buffer.vao.release()
+
+    # -------------------------------------------------------------- input
+
+    def mousePressEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._last_pos = e.position()
+
+    def mouseMoveEvent(self, e) -> None:
+        if self._last_pos is not None and e.buttons() & Qt.MouseButton.LeftButton:
+            delta = e.position() - self._last_pos
+            self._last_pos = e.position()
+            self._yaw += delta.x() * 0.6
+            self._pitch = max(-89.0, min(89.0, self._pitch + delta.y() * 0.6))
+            self.update()
+
+    def mouseReleaseEvent(self, e) -> None:
+        if e.button() == Qt.MouseButton.LeftButton:
+            self._last_pos = None
+
+    def wheelEvent(self, e) -> None:
+        factor = 0.85 if e.angleDelta().y() > 0 else 1.18
+        self._distance = max(0.6, min(30.0, self._distance * factor))
+        self.update()
+
+
 class ModelPreview(QWidget):
     export_requested = pyqtSignal(object, object)  # (PSGModel, Path)
 
@@ -155,13 +362,6 @@ class ModelPreview(QWidget):
         super().__init__(parent)
         self.model: PSGModel | None = None
         self.path: Path | None = None
-        self._display_meshes: list[Mesh] = []
-        self._full_artists = []
-        self._interaction_artists = []
-        self._interactive_lod_active = False
-        self._lod_restore_timer = QTimer(self)
-        self._lod_restore_timer.setSingleShot(True)
-        self._lod_restore_timer.timeout.connect(self._restore_full_detail)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 16, 16, 12)
@@ -178,7 +378,7 @@ class ModelPreview(QWidget):
         header.addLayout(title_column, 1)
 
         self.wireframe = QCheckBox("Wireframe")
-        self.wireframe.toggled.connect(self.redraw_model)
+        self.wireframe.toggled.connect(self._toggle_wireframe)
         header.addWidget(self.wireframe)
         self.warnings_button = QPushButton("Warnings")
         self.warnings_button.setEnabled(False)
@@ -189,15 +389,9 @@ class ModelPreview(QWidget):
         header.addWidget(reset_button)
         layout.addLayout(header)
 
-        self.figure = Figure(facecolor="#18191b")
-        self.axes = self.figure.add_subplot(111, projection="3d")
-        self.figure.subplots_adjust(left=0, right=1, top=1, bottom=0)
-        self.canvas = FigureCanvasQTAgg(self.figure)
-        self.canvas.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
-        self.canvas.mpl_connect("button_press_event", self._on_button_press)
-        self.canvas.mpl_connect("button_release_event", self._on_button_release)
-        self.canvas.mpl_connect("scroll_event", self._on_scroll)
-        layout.addWidget(self.canvas, 1)
+        self.viewport = _GlViewport()
+        self.viewport.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        layout.addWidget(self.viewport, 1)
 
         self.status_label = QLabel("Click and drag to rotate  •  Mouse wheel to zoom")
         self.status_label.setObjectName("modelDetails")
@@ -210,34 +404,31 @@ class ModelPreview(QWidget):
         self.export_btn.clicked.connect(self._on_export)
         button_row.addWidget(self.export_btn)
         layout.addLayout(button_row)
-        self._draw_empty("Select a PSG model from the list")
+
+        self.viewport.set_message("Select a PSG model from the list")
 
     def show_loading(self, path: Path) -> None:
         self.model = None
-        self._display_meshes = []
         self.path = path
         self.title_label.setText(path.name)
         self.details_label.setText("Parsing model…")
         self.warnings_button.setEnabled(False)
         self.export_btn.setEnabled(False)
-        self._draw_empty("Loading…")
+        self.viewport.set_message("Loading…")
 
     def clear(self, message: str = "No model loaded") -> None:
         self.model = None
-        self._display_meshes = []
         self.path = None
         self.title_label.setText("Select a model to preview")
         self.details_label.setText("")
         self.warnings_button.setEnabled(False)
         self.export_btn.setEnabled(False)
-        self._draw_empty(message)
+        self.viewport.set_message(message)
 
     def set_model(self, path: Path, model: PSGModel) -> None:
         self.path = path
         self._subdivide_meshes(model)
-        subdivided_count = model.triangle_count
         self.model = model
-        self._display_meshes = self._decimate_for_display(model)
         self.title_label.setText(path.name)
         self.details_label.setText(
             f"{len(model.meshes):,} meshes  •  {model.vertex_count:,} vertices  •  "
@@ -246,38 +437,47 @@ class ModelPreview(QWidget):
         self.warnings_button.setText(f"Warnings ({len(model.warnings)})")
         self.warnings_button.setEnabled(bool(model.warnings))
         self.export_btn.setEnabled(True)
-        self.redraw_model(reset_camera=True)
-
-        display_triangles = sum(m.triangle_count for m in self._display_meshes)
-        shown = min(display_triangles, MAX_VIEWPORT_TRIANGLES)
-        parts = []
-        if display_triangles < subdivided_count:
-            parts.append(f"preview reduced to {display_triangles:,}")
-        if shown < display_triangles:
-            parts.append(f"showing {shown:,}")
-        label = "  •  ".join(parts)
-        base = "Click and drag to rotate  •  Mouse wheel to zoom"
-        self.status_label.setText(
-            f"{label}  •  {base}" if label else base
-        )
+        self._upload_view_model(reset_camera=True)
 
     @staticmethod
     def _subdivide_meshes(model: PSGModel) -> None:
         for i in range(len(model.meshes)):
             model.meshes[i] = _subdivide_mesh(model.meshes[i])
 
-    @staticmethod
-    def _decimate_for_display(model: PSGModel) -> list[Mesh]:
-        """Build low-poly copies for the preview only — the export model is
-        never touched. Triangles are split proportionally across meshes."""
-        total = max(1, sum(m.triangle_count for m in model.meshes))
-        display_meshes: list[Mesh] = []
-        for mesh in model.meshes:
-            target = max(
-                256, int(DISPLAY_TRIANGLE_BUDGET * mesh.triangle_count / total)
+    def _upload_view_model(self, reset_camera: bool = False) -> None:
+        if self.model is None:
+            return
+        minimum, maximum = self.model.bounds
+        center = (minimum + maximum) * 0.5
+        scale = float(np.max(np.abs(maximum - minimum)))
+        if not np.isfinite(scale) or scale <= 1e-12:
+            scale = 1.0
+
+        meshes = []
+        for mesh in self.model.meshes:
+            if mesh.vertex_count == 0:
+                continue
+            verts = (mesh.vertices - center) / scale * 2.0
+            normals = (
+                mesh.normals if mesh.normals is not None
+                else np.zeros_like(verts)
             )
-            display_meshes.append(_decimate_mesh(mesh, target))
-        return display_meshes
+            meshes.append(
+                Mesh(
+                    name=mesh.name,
+                    vertices=verts.astype(np.float32),
+                    faces=mesh.faces,
+                    uvs=mesh.uvs,
+                    normals=normals.astype(np.float32),
+                    material_name=mesh.material_name,
+                    vertex_stride=mesh.vertex_stride,
+                    attributes=mesh.attributes,
+                    source_offsets=mesh.source_offsets,
+                )
+            )
+        self.viewport.set_meshes(meshes)
+        if reset_camera:
+            self.viewport.reset_camera()
 
     def _on_export(self) -> None:
         if self.model is not None:
@@ -293,271 +493,10 @@ class ModelPreview(QWidget):
         QMessageBox.warning(self, "PSG parser warnings", text)
 
     def redraw_model(self, _checked=False, reset_camera: bool = False) -> None:
-        if self.model is None:
-            return
-
-        previous_view = (self.axes.elev, self.axes.azim)
-        previous_limits = (
-            self.axes.get_xlim3d(),
-            self.axes.get_ylim3d(),
-            self.axes.get_zlim3d(),
-        )
-        self.axes.clear()
-        self._style_axes()
-        self._lod_restore_timer.stop()
-        self._full_artists = []
-        self._interaction_artists = []
-        self._interactive_lod_active = False
-
-        minimum, maximum = self.model.bounds
-        center = (minimum + maximum) * 0.5
-        scale = float(np.max(np.abs(maximum - minimum)))
-        if not np.isfinite(scale) or scale <= 1e-12:
-            scale = 1.0
-
-        remaining_budget = MAX_VIEWPORT_TRIANGLES
-        display_triangles = max(
-            1, sum(m.triangle_count for m in self._display_meshes)
-        )
-        remaining_triangles = display_triangles
-        interaction_remaining_budget = INTERACTION_TRIANGLES
-        interaction_remaining_triangles = remaining_triangles
-        use_interaction_lod = display_triangles > INTERACTION_TRIANGLES
-        for mesh_index, mesh in enumerate(self._display_meshes):
-            if mesh.vertex_count == 0:
-                continue
-
-            vertices = (mesh.vertices - center) / scale * 2.0
-            if mesh.triangle_count == 0:
-                stride = max(1, mesh.vertex_count // 5_000)
-                points = vertices[::stride]
-                artist = self.axes.scatter(
-                    points[:, 0],
-                    points[:, 1],
-                    points[:, 2],
-                    s=1.0,
-                    c="#d8d8d8",
-                    depthshade=True,
-                )
-                self._full_artists.append(artist)
-                continue
-
-            allocation = self._mesh_allocation(
-                mesh.triangle_count,
-                remaining_budget,
-                remaining_triangles,
-            )
-            remaining_budget = max(0, remaining_budget - allocation)
-            remaining_triangles = max(0, remaining_triangles - mesh.triangle_count)
-
-            sampled_faces = self._sample_faces(mesh.faces, allocation)
-            face_normals = (
-                mesh.normals[sampled_faces]
-                if mesh.normals is not None
-                else None
-            )
-            artist = self._make_collection(
-                vertices[sampled_faces],
-                mesh_index,
-                normals=face_normals,
-            )
-            self.axes.add_collection3d(artist)
-            self._full_artists.append(artist)
-
-            if use_interaction_lod:
-                interaction_allocation = self._mesh_allocation(
-                    mesh.triangle_count,
-                    interaction_remaining_budget,
-                    interaction_remaining_triangles,
-                )
-                interaction_remaining_budget = max(
-                    0, interaction_remaining_budget - interaction_allocation
-                )
-                interaction_remaining_triangles = max(
-                    0,
-                    interaction_remaining_triangles - mesh.triangle_count,
-                )
-                interaction_sampled = self._sample_faces(
-                    mesh.faces, interaction_allocation
-                )
-                interaction_normals = (
-                    mesh.normals[interaction_sampled]
-                    if mesh.normals is not None
-                    else None
-                )
-                interaction_artist = self._make_collection(
-                    vertices[interaction_sampled],
-                    mesh_index,
-                    normals=interaction_normals,
-                )
-                interaction_artist.set_visible(False)
-                self.axes.add_collection3d(interaction_artist)
-                self._interaction_artists.append(interaction_artist)
-
-        if reset_camera:
-            self._reset_axes(redraw=False)
-        else:
-            self.axes.view_init(elev=previous_view[0], azim=previous_view[1])
-            self.axes.set_xlim3d(previous_limits[0])
-            self.axes.set_ylim3d(previous_limits[1])
-            self.axes.set_zlim3d(previous_limits[2])
-        self.canvas.draw_idle()
-
-    def _make_collection(
-        self, triangles: np.ndarray, mesh_index: int,
-        normals: np.ndarray | None = None,
-    ) -> Poly3DCollection:
-        if self.wireframe.isChecked():
-            return Poly3DCollection(
-                triangles,
-                facecolors=(0.055, 0.055, 0.055, 1.0),
-                edgecolors=(0.78, 0.78, 0.78, 0.82),
-                linewidths=0.18,
-                antialiased=False,
-                zsort="average",
-            )
-
-        light = np.array((0.35, -0.45, 0.82), dtype=np.float32)
-        light /= np.linalg.norm(light)
-
-        if normals is not None:
-            vert_intensity = np.clip(
-                0.25 + 0.68 * np.abs(normals @ light), 0.22, 0.93
-            )
-            intensity = vert_intensity.mean(axis=1)
-        else:
-            edge_a = triangles[:, 1] - triangles[:, 0]
-            edge_b = triangles[:, 2] - triangles[:, 0]
-            face_normals = np.cross(edge_a, edge_b)
-            lengths = np.linalg.norm(face_normals, axis=1)
-            valid = lengths > 1e-12
-            face_normals[valid] /= lengths[valid, None]
-            intensity = np.clip(
-                0.25 + 0.68 * np.abs(face_normals @ light), 0.22, 0.93
-            )
-
-        intensity = np.clip(
-            intensity + ((mesh_index % 3) - 1) * 0.035, 0.18, 0.96
-        )
-        facecolors = np.empty((len(triangles), 4), dtype=np.float32)
-        facecolors[:, :3] = intensity[:, None]
-        facecolors[:, 3] = 1.0
-
-        return Poly3DCollection(
-            triangles,
-            facecolors=facecolors,
-            edgecolors="none",
-            linewidths=0.0,
-            antialiased=False,
-            zsort="average",
-        )
-
-    @staticmethod
-    def _mesh_allocation(
-        triangle_count: int, remaining_budget: int, remaining_triangles: int
-    ) -> int:
-        if remaining_budget <= 0:
-            return 0
-        return min(
-            triangle_count,
-            max(
-                1,
-                round(
-                    remaining_budget
-                    * (triangle_count / max(1, remaining_triangles))
-                ),
-            ),
-        )
-
-    @staticmethod
-    def _sample_faces(faces: np.ndarray, allocation: int) -> np.ndarray:
-        if allocation <= 0:
-            return faces[:0]
-        if allocation >= len(faces):
-            return faces
-        face_ids = np.linspace(0, len(faces) - 1, allocation, dtype=np.int64)
-        return faces[face_ids]
+        self._upload_view_model(reset_camera=reset_camera)
 
     def reset_view(self) -> None:
-        self._reset_axes(redraw=True)
+        self.viewport.reset_camera()
 
-    def _reset_axes(self, redraw: bool) -> None:
-        self._style_axes()
-        self.axes.view_init(elev=22, azim=-55)
-        self.axes.set_xlim3d(-1.15, 1.15)
-        self.axes.set_ylim3d(-1.15, 1.15)
-        self.axes.set_zlim3d(-1.15, 1.15)
-        try:
-            self.axes.set_box_aspect((1, 1, 1), zoom=1.05)
-        except TypeError:
-            self.axes.set_box_aspect((1, 1, 1))
-        if redraw:
-            self.canvas.draw_idle()
-
-    def _style_axes(self) -> None:
-        self.axes.set_facecolor("#18191b")
-        self.axes.set_axis_off()
-        self.axes.grid(False)
-
-    def _draw_empty(self, message: str) -> None:
-        self._lod_restore_timer.stop()
-        self._full_artists = []
-        self._interaction_artists = []
-        self._interactive_lod_active = False
-        self.axes.clear()
-        self._style_axes()
-        self.axes.text2D(
-            0.5,
-            0.5,
-            message,
-            color="#9aa0a6",
-            horizontalalignment="center",
-            verticalalignment="center",
-            transform=self.axes.transAxes,
-        )
-        self._reset_axes(redraw=True)
-
-    def _on_button_press(self, event) -> None:
-        if event.inaxes is self.axes:
-            self._set_interaction_lod(True, immediate=True)
-
-    def _on_button_release(self, _event) -> None:
-        self._restore_full_detail()
-
-    def _on_scroll(self, event) -> None:
-        if event.inaxes is not self.axes:
-            return
-        self._set_interaction_lod(True)
-        factor = 0.84 if event.step > 0 else 1.19
-        for getter, setter in (
-            (self.axes.get_xlim3d, self.axes.set_xlim3d),
-            (self.axes.get_ylim3d, self.axes.set_ylim3d),
-            (self.axes.get_zlim3d, self.axes.set_zlim3d),
-        ):
-            low, high = getter()
-            center = (low + high) * 0.5
-            half = (high - low) * 0.5 * factor
-            setter(center - half, center + half)
-        self.canvas.draw_idle()
-        self._lod_restore_timer.start(180)
-
-    def _set_interaction_lod(
-        self, enabled: bool, immediate: bool = False
-    ) -> None:
-        if (
-            not self._interaction_artists
-            or self._interactive_lod_active == enabled
-        ):
-            return
-        for artist in self._full_artists:
-            artist.set_visible(not enabled)
-        for artist in self._interaction_artists:
-            artist.set_visible(enabled)
-        self._interactive_lod_active = enabled
-        if immediate:
-            self.canvas.draw()
-        else:
-            self.canvas.draw_idle()
-
-    def _restore_full_detail(self) -> None:
-        self._set_interaction_lod(False)
+    def _toggle_wireframe(self, checked: bool) -> None:
+        self.viewport.set_wireframe(checked)
