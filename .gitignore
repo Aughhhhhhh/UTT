@@ -12,3 +12,10 @@ exports/
 *.log
 build_log*.txt
 plan.txt
+
+tests/
+dummy.py
+current_items_example.txt
+mdl_EA_SKATE_4_7_0.py
+PsgMeshnBones-1.py
+0x00000dca03e38811.glb

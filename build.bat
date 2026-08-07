@@ -2,9 +2,10 @@
 setlocal
 cd /d "%~dp0"
 
-REM Builds the app as a folder (onedir) so it starts instantly instead of
-REM re-extracting to %TEMP% on every launch like the old onefile build.
-REM The EXE is placed directly in build\ with its _internal folder beside it.
+REM Builds the app as a single EXE (onefile) so every module, library, and
+REM bundled data file is baked inside UTT.exe — no _internal folder beside it.
+REM The EXE is placed directly in build\. Startup is a little slower because
+REM PyInstaller unpacks to %TEMP% on first launch.
 REM The cache folder in build is intentionally preserved.
 set "ASSETS_SRC=%CD%\assets"
 
@@ -22,7 +23,7 @@ if errorlevel 1 (
 
 set "STAGE=%CD%\build\_app_stage"
 
-python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name UTT --icon "%CD%\UTT.ico" ^
+python -m PyInstaller --noconfirm --clean --onefile --noupx --windowed --name UTT --icon "%CD%\UTT.ico" ^
   --version-file "%CD%\version_info.txt" ^
   --distpath "%STAGE%" ^
   --workpath "%CD%\build\_pyinstaller" ^
@@ -41,12 +42,16 @@ python -m PyInstaller --noconfirm --clean --onedir --noupx --windowed --name UTT
 
 if errorlevel 1 exit /b %errorlevel%
 
-move /Y "%STAGE%\UTT\UTT.exe" "%CD%\build\UTT.exe" >nul
-if errorlevel 1 exit /b %errorlevel%
-if exist "%CD%\build\_internal" rmdir /S /Q "%CD%\build\_internal"
-move "%STAGE%\UTT\_internal" "%CD%\build\_internal" >nul
+move /Y "%STAGE%\UTT.exe" "%CD%\build\UTT.exe" >nul
 if errorlevel 1 exit /b %errorlevel%
 rmdir /S /Q "%STAGE%"
+
+REM Remove any _internal left over from a previous onedir build.
+if exist "%CD%\build\_internal" rmdir /S /Q "%CD%\build\_internal"
+
+REM Crash logs are dev-only (written when running from source), so never
+REM leave a stale one in the folder that gets distributed.
+if exist "%CD%\build\utt_crash.log" del /Q "%CD%\build\utt_crash.log"
 
 if not exist "%CD%\build\assets" mkdir "%CD%\build\assets"
 xcopy "%ASSETS_SRC%\*" "%CD%\build\assets\" /E /I /Y >nul

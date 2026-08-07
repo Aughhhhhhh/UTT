@@ -36,6 +36,8 @@ class Mesh:
     faces: np.ndarray
     uvs: np.ndarray | None = None
     normals: np.ndarray | None = None
+    joints: np.ndarray | None = None
+    weights: np.ndarray | None = None
     material_name: str | None = None
     vertex_stride: int = 0
     attributes: tuple[VertexAttribute, ...] = ()
@@ -46,6 +48,10 @@ class Mesh:
         self.faces = np.ascontiguousarray(self.faces, dtype=np.uint32)
         if self.uvs is not None:
             self.uvs = np.ascontiguousarray(self.uvs, dtype=np.float32)
+        if self.joints is not None:
+            self.joints = np.ascontiguousarray(self.joints, dtype=np.uint8)
+        if self.weights is not None:
+            self.weights = np.ascontiguousarray(self.weights, dtype=np.uint8)
 
         if self.vertices.ndim != 2 or self.vertices.shape[1] != 3:
             raise ValueError("vertices must have shape (N, 3)")
@@ -53,6 +59,10 @@ class Mesh:
             raise ValueError("faces must have shape (N, 3)")
         if self.uvs is not None and (self.uvs.ndim != 2 or self.uvs.shape[1] != 2):
             raise ValueError("uvs must have shape (N, 2)")
+        if self.joints is not None and self.joints.shape != (self.vertex_count, 4):
+            raise ValueError("joints must have shape (N, 4)")
+        if self.weights is not None and self.weights.shape != (self.vertex_count, 4):
+            raise ValueError("weights must have shape (N, 4)")
 
     @property
     def vertex_count(self) -> int:
@@ -78,6 +88,7 @@ class PSGModel:
     warnings: list[str] = field(default_factory=list)
     source_path: Path | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    palette: list[int] = field(default_factory=list)
 
     @property
     def vertex_count(self) -> int:

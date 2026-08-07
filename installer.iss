@@ -1,5 +1,5 @@
 #define AppName "UTT"
-#define AppVersion "1.1.7"
+#define AppVersion "1.1.8"
 #define AppExeName "UTT.exe"
 
 [Setup]
@@ -18,7 +18,7 @@ ArchitecturesAllowed=x64compatible
 OutputDir=build\installer
 OutputBaseFilename=UTT-Setup-{#AppVersion}
 SetupIconFile=UTT.ico
-UninstallDisplayIcon={app}\UTT.ico
+UninstallDisplayIcon={app}\UTT.exe
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
@@ -33,15 +33,11 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Files]
 Source: "build\UTT.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\UTT.ico"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\xbx.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\ps3.png"; DestDir: "{app}"; Flags: ignoreversion
-Source: "build\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "build\assets\*"; DestDir: "{app}\assets"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Icons]
-Name: "{group}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\UTT.ico"
-Name: "{autodesktop}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\UTT.ico"; Tasks: desktopicon
+Name: "{group}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"
+Name: "{autodesktop}\UTT"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\{#AppExeName}"; Tasks: desktopicon
 
 [Registry]
 ; Open .rx2 and .psg files with UTT's quick viewer on double-click.

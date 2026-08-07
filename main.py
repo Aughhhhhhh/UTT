@@ -49,7 +49,8 @@ def find_opened_file() -> Path | None:
 
 
 def main() -> int:
-    _install_crash_logger()
+    if not getattr(sys, "frozen", False):
+        _install_crash_logger()
     app = QApplication(sys.argv)
     app.setApplicationName("UTT")
     app.setOrganizationName("UTT")

@@ -26,12 +26,12 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
   compression level in the Repack dialog; uncompressed is fastest).
 - Live character scan for PS3: read the current character's models and
   textures from RPCS3 memory and preview them (saved to `output/current_items.txt`).
-- Crash log: if something goes wrong, details are written to `utt_crash.log`
-  next to the executable.
+- Crash log: when running from source for development, details are written to
+  `utt_crash.log` next to the executable. Packaged builds do not write crash logs.
 
 ## Install
 
-Download `UTT-Setup-1.1.7.exe` from the
+Download `UTT-Setup-1.1.8.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -59,7 +59,8 @@ Install the build dependencies:
 python -m pip install -r requirements-build.txt
 ```
 
-Build the portable executable:
+Build the portable executable (a single self-contained `UTT.exe` with
+everything baked inside):
 
 ```powershell
 .\build.bat
@@ -89,8 +90,8 @@ Collaborators with write access can publish installers without the GitHub CLI:
    separate Git installation.
 3. Run `build_installer.bat`.
 4. Open the repository's **Releases** page and choose **Draft a new release**.
-5. Create a tag matching the version, such as `v1.1.7`, and attach
-   `build/installer/UTT-Setup-1.1.7.exe`.
+5. Create a tag matching the version, such as `v1.1.8`, and attach
+   `build/installer/UTT-Setup-1.1.8.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release

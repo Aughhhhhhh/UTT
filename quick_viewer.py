@@ -406,7 +406,7 @@ class QuickFileViewer(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, APP_TITLE, str(exc))
 
-    def _export_loaded_model(self, model, path: Path) -> None:
+    def _export_loaded_model(self, model, path: Path, with_skin=False) -> None:
         default = Path(path).with_suffix(".glb")
         target, _ = QFileDialog.getSaveFileName(
             self, "Export model as glTF Binary", str(default),
@@ -417,7 +417,7 @@ class QuickFileViewer(QMainWindow):
 
         def task():
             from gltf_exporter import export_gltf
-            return export_gltf(model, target)
+            return export_gltf(model, target, with_skin=with_skin)
 
         def done(result):
             QMessageBox.information(self, APP_TITLE, f"Model exported:\n{result}")

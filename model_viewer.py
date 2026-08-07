@@ -15,6 +15,7 @@ from PyQt6.QtOpenGL import (
 from PyQt6.QtOpenGLWidgets import QOpenGLWidget
 from PyQt6.QtWidgets import (
     QCheckBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QMessageBox,
@@ -77,10 +78,15 @@ def _subdivide_mesh(mesh: Mesh) -> Mesh:
     norms = mesh.normals
     faces = mesh.faces
     uvs = mesh.uvs
+    joints = mesh.joints
+    weights = mesh.weights
     edge_map: dict[tuple[int, int], int] = {}
     new_verts = list(verts)
     new_norms = list(norms)
     new_uvs = list(uvs) if uvs is not None else None
+    has_skin = joints is not None and weights is not None
+    new_joints = list(joints) if has_skin else []
+    new_weights = list(weights) if has_skin else []
 
     def midpoint(i: int, j: int) -> int:
         key = (i, j) if i < j else (j, i)
@@ -93,6 +99,18 @@ def _subdivide_mesh(mesh: Mesh) -> Mesh:
         new_norms.append(avg / np.linalg.norm(avg))
         if new_uvs is not None:
             new_uvs.append((uvs[i] + uvs[j]) * 0.5)
+        if has_skin:
+            new_joints.append(((joints[i].astype(np.uint16) + joints[j]) // 2).astype(np.uint8))
+            wi = weights[i].astype(np.uint32) + weights[j]
+            total = int(wi.sum())
+            if total == 0:
+                new_weights.append(np.zeros(4, dtype=np.uint8))
+            else:
+                wi = (wi * 255) // total
+                rem = 255 - int(wi.sum())
+                if rem:
+                    wi[np.argsort(wi)[::-1][:rem]] += 1
+                new_weights.append(wi.astype(np.uint8))
         edge_map[key] = idx
         return idx
 
@@ -112,6 +130,8 @@ def _subdivide_mesh(mesh: Mesh) -> Mesh:
         faces=np.asarray(new_faces, dtype=np.uint32),
         uvs=np.asarray(new_uvs, dtype=np.float32) if new_uvs is not None else None,
         normals=np.asarray(new_norms, dtype=np.float32),
+        joints=np.asarray(new_joints, dtype=np.uint8) if has_skin else None,
+        weights=np.asarray(new_weights, dtype=np.uint8) if has_skin else None,
         material_name=mesh.material_name,
         vertex_stride=mesh.vertex_stride,
         attributes=mesh.attributes,
@@ -356,9 +376,9 @@ class _GlViewport(QOpenGLWidget):
 
 
 class ModelPreview(QWidget):
-    export_requested = pyqtSignal(object, object)  # (PSGModel, Path)
+    export_requested = pyqtSignal(object, object, bool)  # (PSGModel, Path, with_skin)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, file_label: str | None = None):
         super().__init__(parent)
         self.model: PSGModel | None = None
         self.path: Path | None = None
@@ -371,7 +391,14 @@ class ModelPreview(QWidget):
         title_column = QVBoxLayout()
         self.title_label = QLabel("Select a model to preview")
         self.title_label.setObjectName("modelTitle")
-        self.details_label = QLabel("Models are parsed directly from the cached PSG files.")
+        if file_label:
+            self.details_label = QLabel(
+                f"Models are parsed directly from the cached {file_label} files."
+            )
+        else:
+            self.details_label = QLabel(
+                "Models are parsed directly from the cached game files."
+            )
         self.details_label.setObjectName("modelDetails")
         title_column.addWidget(self.title_label)
         title_column.addWidget(self.details_label)
@@ -399,13 +426,21 @@ class ModelPreview(QWidget):
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
+        self.export_mode = QComboBox()
+        self.export_mode.addItem("Static mesh (bind pose)")
+        self.export_mode.addItem("With bones (skinned)")
+        self.export_mode.setEnabled(False)
+        button_row.addWidget(self.export_mode)
         self.export_btn = QPushButton("Export as glTF…")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._on_export)
         button_row.addWidget(self.export_btn)
         layout.addLayout(button_row)
 
-        self.viewport.set_message("Select a PSG model from the list")
+        if file_label:
+            self.viewport.set_message(f"Select a {file_label} model from the list")
+        else:
+            self.viewport.set_message("Select a model from the list")
 
     def show_loading(self, path: Path) -> None:
         self.model = None
@@ -436,6 +471,17 @@ class ModelPreview(QWidget):
         )
         self.warnings_button.setText(f"Warnings ({len(model.warnings)})")
         self.warnings_button.setEnabled(bool(model.warnings))
+        has_skin = bool(model.bones) and any(
+            mesh.joints is not None for mesh in model.meshes
+        )
+        self.export_mode.setEnabled(has_skin)
+        if has_skin:
+            from mainui import get_saved_export_mode
+            self.export_mode.setCurrentIndex(
+                1 if get_saved_export_mode() == "bones" else 0
+            )
+        else:
+            self.export_mode.setCurrentIndex(0)
         self.export_btn.setEnabled(True)
         self._upload_view_model(reset_camera=True)
 
@@ -481,7 +527,9 @@ class ModelPreview(QWidget):
 
     def _on_export(self) -> None:
         if self.model is not None:
-            self.export_requested.emit(self.model, self.path)
+            self.export_requested.emit(
+                self.model, self.path, self.export_mode.currentIndex() == 1
+            )
 
     def show_warnings(self) -> None:
         if self.model is None or not self.model.warnings:
@@ -490,7 +538,7 @@ class ModelPreview(QWidget):
         text = "\n\n".join(warnings)
         if len(self.model.warnings) > len(warnings):
             text += f"\n\n…and {len(self.model.warnings) - len(warnings)} more."
-        QMessageBox.warning(self, "PSG parser warnings", text)
+        QMessageBox.warning(self, "Parser warnings", text)
 
     def redraw_model(self, _checked=False, reset_camera: bool = False) -> None:
         self._upload_view_model(reset_camera=reset_camera)

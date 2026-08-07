@@ -12,8 +12,15 @@ from S3RecipeHandler.Recipe import Recipe
 RECIPE_ADDRESS = 0x3018DE800
 RECIPE_SIZE = 6500
 
+# Xbox 360 build recipe location — NOT KNOWN YET. The PS3 address above does
+# not apply to the 360 build. Find the current-skater recipe in the 360 game
+# (Cheat Engine AOB scan for a known equipped asset id, or Ghidra on
+# default.xex) and set the guest address here. The same guest address works
+# for both Xenia and skate3recomp (same game build).
+XBOX_RECIPE_ADDRESS = 0x00000000
 
-class RPCS3NotFoundError(Exception):
+
+class GameNotFoundError(Exception):
     pass
 
 
@@ -28,20 +35,41 @@ def get_base_path() -> Path:
 
 
 def find_rpcs3() -> pymem.Pymem:
-    entry = pymem.process.process_from_name("rpcs3")
+    entry = pymem.process.process_from_name("rpcs3.exe")
     if entry is None:
-        raise RPCS3NotFoundError(
+        raise GameNotFoundError(
             "RPCS3 was not found, make sure the emulator is open before scanning."
         )
     try:
         return pymem.Pymem(entry.th32ProcessID)
     except pymem.exception.ProcessError as e:
-        raise RPCS3NotFoundError(f"RPCS3 was found but could not be opened: {e}")
+        raise GameNotFoundError(f"RPCS3 was found but could not be opened: {e}")
 
 
-def read_recipe_bytes(rpcs3: pymem.Pymem) -> bytes:
+def find_target() -> tuple:
+    """Attach to the Xbox 360 game process: skate3recomp (skate3.exe) first,
+    then Xenia (canary or master)."""
+    for name, label in (
+        ("skate3.exe", "skate3.exe (Recomp)"),
+        ("xenia_canary.exe", "Xenia Canary"),
+        ("xenia.exe", "Xenia"),
+    ):
+        entry = pymem.process.process_from_name(name)
+        if entry is None:
+            continue
+        try:
+            return pymem.Pymem(entry.th32ProcessID), label
+        except pymem.exception.ProcessError as e:
+            raise GameNotFoundError(f"{label} was found but could not be opened: {e}")
+    raise GameNotFoundError(
+        "No Xbox 360 game process found — start skate3recomp (skate3.exe) "
+        "or Xenia before scanning."
+    )
+
+
+def read_recipe_bytes(proc: pymem.Pymem, address: int) -> bytes:
     try:
-        return rpcs3.read_bytes(RECIPE_ADDRESS, RECIPE_SIZE)
+        return proc.read_bytes(address, RECIPE_SIZE)
     except pymem.exception.PymemMemoryError as e:
         raise RecipeReadError(
             f"Could not read the recipe from memory, is a skate 3 save loaded? ({e})"
@@ -113,20 +141,44 @@ def read_items_txt(txt_path) -> list:
     return items
 
 
-def scan_and_save(output_folder: Path = None) -> dict:
-    rpcs3 = find_rpcs3()
-    recipe_bytes = read_recipe_bytes(rpcs3)
+def scan_and_save(output_folder: Path = None, platform: str = "ps3") -> dict:
+    if platform == "xbx":
+        if XBOX_RECIPE_ADDRESS == 0:
+            raise RecipeReadError(
+                "The Xbox 360 recipe address is not known yet. Find the "
+                "current-skater recipe in the 360 game (Cheat Engine AOB scan "
+                "for a known equipped asset id, or Ghidra on default.xex) and "
+                "set XBOX_RECIPE_ADDRESS in recipe.py."
+            )
+        proc, target = find_target()
+        address = XBOX_RECIPE_ADDRESS
+    else:
+        proc = find_rpcs3()
+        address = RECIPE_ADDRESS
+        target = "RPCS3"
+    recipe_bytes = read_recipe_bytes(proc, address)
     items = parse_recipe(recipe_bytes)
     if output_folder is None:
-        output_folder = get_base_path() / "Output"
+        output_folder = get_base_path() / ("output_xbx" if platform == "xbx" else "output")
     if output_folder.exists():
         shutil.rmtree(output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     txt_path = write_items_txt(items, output_folder)
-    return {"items": items, "txt_path": txt_path, "output_folder": output_folder}
+    return {
+        "items": items,
+        "txt_path": txt_path,
+        "output_folder": output_folder,
+        "target": target,
+    }
 
 
 if __name__ == "__main__":
-    result = scan_and_save()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--platform", choices=["ps3", "xbx"], default="ps3")
+    args = parser.parse_args()
+    result = scan_and_save(platform=args.platform)
+    print(f"Attached to {result['target']}")
     print(f"Found {len(result['items'])} items")
     print(f"Saved to {result['txt_path']}")

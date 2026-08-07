@@ -22,6 +22,7 @@ TYPE_FACE = b"\x00\x02\x00\xEB"
 TYPE_MESH_INFO = b"\x00\x02\x00\xE9"
 TYPE_MATERIAL = b"\x00\xEB\x00\x05"
 TYPE_BONES = b"\x00\xEB\x00\x01"
+TYPE_PALETTE = b"\x00\xEB\x00\x23"
 
 
 @dataclass(slots=True, frozen=True)
@@ -45,7 +46,9 @@ class _MeshLayout:
     stride: int
     position: VertexAttribute
     uv1: VertexAttribute | None
-    attributes: tuple[VertexAttribute, ...]
+    joints: VertexAttribute | None = None
+    weights: VertexAttribute | None = None
+    attributes: tuple[VertexAttribute, ...] = ()
 
 
 _DTYPE_MAP: dict[str, np.dtype] = {
@@ -175,6 +178,7 @@ def _parse_model(
     mesh_info_offsets: list[int] = []
     material_offsets: list[int] = []
     bone_offsets: list[int] = []
+    palette_offsets: list[int] = []
 
     for record in records:
         resource_type = record.resource_type
@@ -210,6 +214,8 @@ def _parse_model(
             material_offsets.append(info[6])
         elif resource_type == TYPE_BONES:
             bone_offsets.append(record.values[0])
+        elif resource_type == TYPE_PALETTE:
+            palette_offsets.append(record.values[0])
 
     materials: list[MaterialParameter] = []
     mesh_names: list[str] = []
@@ -253,13 +259,14 @@ def _parse_model(
 
         try:
             layout = _parse_mesh_layout(raw, mesh_info_offset, warnings, platform)
-            vertices, uvs = _parse_vertices(
+            vertices, uvs, joints, weights = _parse_vertices(
                 raw,
                 vertex_resource,
                 header_size,
                 layout,
                 warnings,
                 mesh_index,
+                platform,
             )
             faces = _parse_faces(
                 raw,
@@ -285,6 +292,8 @@ def _parse_model(
                 faces=faces,
                 uvs=uvs,
                 normals=normals,
+                joints=joints,
+                weights=weights,
                 material_name=_material_for_mesh(
                     diffuse_names, mesh_index, paired_count
                 ),
@@ -311,6 +320,24 @@ def _parse_model(
                 raise
             warnings.append(f"Skeleton at 0x{bone_offset:X}: {exc}")
 
+    palette: list[int] = []
+    if bones:
+        for palette_offset in _deduplicate(palette_offsets):
+            try:
+                palette = _parse_palette(
+                    raw, palette_offset, len(bones), platform
+                )
+                break
+            except PSGDataError as exc:
+                if strict:
+                    raise
+                warnings.append(f"Bone palette at 0x{palette_offset:X}: {exc}")
+    if not palette and palette_offsets:
+        warnings.append(
+            "No usable bone palette found; vertex skin indices will be used "
+            "as direct bone indices on export"
+        )
+
     names_location_offset = None
     names_location = None
     if len(raw) >= 0x234:
@@ -323,6 +350,7 @@ def _parse_model(
         materials=materials,
         warnings=warnings,
         source_path=Path(source_path) if source_path is not None else None,
+        palette=palette,
         metadata={
             "magic": MAGIC_X360 if platform == "xbx" else MAGIC_PS3,
             "type": raw[type_offset:type_offset + 4],
@@ -438,6 +466,8 @@ def _parse_mesh_layout(
     attributes: list[VertexAttribute] = []
     position: VertexAttribute | None = None
     uv1: VertexAttribute | None = None
+    joints: VertexAttribute | None = None
+    weights: VertexAttribute | None = None
 
     for descriptor in descriptors:
         attribute = _classify_descriptor(descriptor, platform)
@@ -461,6 +491,10 @@ def _parse_mesh_layout(
             position = attribute
         elif attribute.semantic == "uv1" and uv1 is None:
             uv1 = attribute
+        elif attribute.semantic == "joints" and joints is None:
+            joints = attribute
+        elif attribute.semantic == "weights" and weights is None:
+            weights = attribute
 
     if position is None:
         raw_descriptors = ", ".join(item.hex() for item in descriptors)
@@ -478,6 +512,8 @@ def _parse_mesh_layout(
         stride=stride,
         position=position,
         uv1=uv1,
+        joints=joints,
+        weights=weights,
         attributes=tuple(attributes),
     )
 
@@ -511,6 +547,12 @@ def _classify_descriptor(descriptor: bytes, platform: str = "ps3") -> VertexAttr
         return VertexAttribute("uv2", raw_offset, "int16", 2, descriptor)
     if descriptor == b"\x00\x2C\x23\x5F\x00\x05\x02\x08":
         return VertexAttribute("uv3", raw_offset, "float16", 2, descriptor)
+
+    # Skin: U8 x4 pairs; etype 7 = bone indices, etype 1 = bone weights.
+    if prefix == b"\x07\x04" and suffix == b"\x07\x01":
+        return VertexAttribute("joints", raw_offset, "uint8", 4, descriptor)
+    if prefix == b"\x07\x04" and suffix == b"\x01\x01":
+        return VertexAttribute("weights", raw_offset, "uint8", 4, descriptor)
     return None
 
 
@@ -547,6 +589,13 @@ def _classify_descriptor_x360(descriptor: bytes) -> VertexAttribute | None:
         return VertexAttribute("uv2", offset, "int16", 2, descriptor)
     if kind == b"\x00\x2C\x23\x5F\x00\x05\x02\x08":
         return VertexAttribute("uv3", offset, "float16", 2, descriptor)
+
+    # Skin: U8 x4 pairs, packed as one u32 at the descriptor's offset
+    # (big-endian on Xbox, little-endian on PS3; same logical values).
+    if kind == b"\x00\x1A\x22\x86\x00\x02\x00\x0E":
+        return VertexAttribute("joints", offset, "uint8", 4, descriptor)
+    if kind == b"\x00\x1A\x22\x86\x00\x01\x00\x0F":
+        return VertexAttribute("weights", offset, "uint8", 4, descriptor)
     return None
 
 
@@ -585,7 +634,8 @@ def _parse_vertices(
     layout: _MeshLayout,
     warnings: list[str],
     mesh_index: int,
-) -> tuple[np.ndarray, np.ndarray | None]:
+    platform: str = "ps3",
+) -> tuple[np.ndarray, np.ndarray | None, np.ndarray | None, np.ndarray | None]:
     if resource.size <= 0:
         raise PSGDataError(f"invalid vertex buffer size {resource.size}")
     buffer_offset = resource.offset + header_size
@@ -600,7 +650,8 @@ def _parse_vertices(
         )
 
     vertices = _decode_interleaved(
-        data, buffer_offset, vertex_count, layout.stride, layout.position
+        data, buffer_offset, vertex_count, layout.stride, layout.position,
+        platform,
     )
     if not np.isfinite(vertices).all():
         invalid = int(np.size(vertices) - np.isfinite(vertices).sum())
@@ -612,12 +663,64 @@ def _parse_vertices(
     uvs = None
     if layout.uv1 is not None:
         uvs = _decode_interleaved(
-            data, buffer_offset, vertex_count, layout.stride, layout.uv1
+            data, buffer_offset, vertex_count, layout.stride, layout.uv1,
+            platform,
         )
         if not np.isfinite(uvs).all():
             uvs = np.nan_to_num(uvs, copy=False)
 
-    return vertices, uvs
+    joints = None
+    weights = None
+    if layout.joints is not None and layout.weights is not None:
+        joints, weights = _decode_skin(
+            data, buffer_offset, vertex_count, layout.stride,
+            layout.joints, layout.weights, platform,
+        )
+
+    return vertices, uvs, joints, weights
+
+
+def _decode_skin(
+    data: bytes,
+    buffer_offset: int,
+    count: int,
+    stride: int,
+    joints_attr: VertexAttribute,
+    weights_attr: VertexAttribute,
+    platform: str,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Decode per-vertex skin data.
+
+    Both platforms store one u32 per vertex for the four bone indices and
+    another for the four weights (U8 pairs, byte-aligned).  The u32 is
+    little-endian on PS3 and big-endian on Xbox 360; converting the value
+    back to little-endian bytes yields the index/weight byte order shared
+    by both platforms.
+    """
+    endian = "little" if platform == "ps3" else "big"
+    last_end = buffer_offset + (count - 1) * stride + max(
+        joints_attr.offset, weights_attr.offset
+    ) + 4
+    if last_end > len(data):
+        raise PSGDataError(f"skin data ends at 0x{last_end:X}, beyond the file")
+
+    joints = np.empty((count, 4), dtype=np.uint8)
+    weights = np.empty((count, 4), dtype=np.uint8)
+    for index in range(count):
+        row = buffer_offset + index * stride
+        packed_joints = int.from_bytes(
+            data[row + joints_attr.offset: row + joints_attr.offset + 4], endian
+        )
+        packed_weights = int.from_bytes(
+            data[row + weights_attr.offset: row + weights_attr.offset + 4], endian
+        )
+        joints[index] = np.frombuffer(
+            packed_joints.to_bytes(4, "little"), dtype=np.uint8
+        )
+        weights[index] = np.frombuffer(
+            packed_weights.to_bytes(4, "little"), dtype=np.uint8
+        )
+    return joints, weights
 
 
 def _parse_faces(
@@ -675,6 +778,7 @@ def _decode_interleaved(
     count: int,
     stride: int,
     attribute: VertexAttribute,
+    platform: str = "ps3",
 ) -> np.ndarray:
     dtype = _DTYPE_MAP[attribute.data_type]
     required_end = (
@@ -696,10 +800,15 @@ def _decode_interleaved(
         strides=(stride, dtype.itemsize),
     )
     values = array.astype(np.float32, copy=True)
-    # Noesis normalizes integer vertex attributes (SHORT -> /32768,
-    # USHORT -> /65535) the same way as position buffers.
     if attribute.data_type == "int16":
-        values /= np.float32(32768.0)
+        if attribute.semantic == "position" and platform == "ps3":
+            # PS3 stores S16 positions in bone units (1/16384 of a unit);
+            # the Blender reference importer dequantizes with 16384.
+            values /= np.float32(16384.0)
+        else:
+            # Noesis normalizes integer vertex attributes (SHORT -> /32768,
+            # USHORT -> /65535) the same way as position buffers.
+            values /= np.float32(32768.0)
     elif attribute.data_type == "uint16":
         values /= np.float32(65535.0)
     return values
@@ -747,6 +856,32 @@ def _parse_bones(
         Bone(name=name, matrix=matrix, skeleton_index=skeleton_index)
         for name, matrix in zip(names, matrices)
     ]
+
+
+def _parse_palette(
+    data: bytes,
+    offset: int,
+    bone_count: int,
+    platform: str = "ps3",
+) -> list[int]:
+    """Read the skin bone palette (record type 0x00EB0023).
+
+    A u16 big-endian list of bone indices, terminated by 0xFFFF or by any
+    value >= bone_count.  The table starts 0x6C bytes into the block on
+    PS3 and 0x70 on Xbox 360 (the X360 block is 4 bytes longer).
+    """
+    table_offset = offset + (0x70 if platform == "xbx" else 0x6C)
+    palette: list[int] = []
+    for entry in range(1024):
+        value = _unpack(data, ">H", table_offset + entry * 2, "palette entry")[0]
+        if value == 0xFFFF or value >= bone_count:
+            break
+        palette.append(value)
+    if not palette:
+        raise PSGDataError("palette table is empty or not located at the expected offset")
+    if any(left >= right for left, right in zip(palette, palette[1:])):
+        raise PSGDataError("palette table is not in bone order; offset is wrong")
+    return palette
 
 
 def _name_for_mesh(names: list[str], index: int, mesh_count: int) -> str:

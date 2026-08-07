@@ -32,6 +32,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
+APP_VERSION = "1.1.8"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -201,6 +202,10 @@ class TitleBar(QFrame):
         title = QLabel(APP_TITLE)
         title.setObjectName("windowTitle")
         layout.addWidget(title)
+
+        version_label = QLabel(f"v{APP_VERSION}")
+        version_label.setObjectName("versionLabel")
+        layout.addWidget(version_label)
         layout.addStretch(1)
 
         credits_button = QPushButton("Credits")
@@ -397,6 +402,32 @@ def save_platform(platform: str) -> None:
         pass
 
 
+def export_mode_file() -> Path:
+    return working_dir() / "export_mode.txt"
+
+
+def get_saved_export_mode() -> str:
+    """Return "bones", "mesh", or "" when no default is saved."""
+    try:
+        value = export_mode_file().read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return ""
+    return value if value in ("bones", "mesh") else ""
+
+
+def save_export_mode(mode: str) -> None:
+    if mode not in ("bones", "mesh"):
+        try:
+            export_mode_file().unlink()
+        except OSError:
+            pass
+        return
+    try:
+        export_mode_file().write_text(mode, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def choose_platform(parent=None) -> str:
     """Return the chosen platform, showing the picker only when none is saved."""
     saved = get_saved_platform()
@@ -444,13 +475,15 @@ def _force_opaque(image) -> "PIL Image":
 
 
 class ArchivePicker(QDialog):
-    """Non-dismissable first-run gate used to select createacharacter.big."""
+    """Optional first-run picker for createacharacter.big.
+
+    Closing it (X or Escape) skips the cache and continues into the app.
+    """
     def __init__(self, parent=None, platform: str = "ps3"):
         super().__init__(parent)
         self.selected_path: Path | None = None
         self.setWindowTitle("Select createacharacter.big")
         self.setModal(True)
-        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
         self.setMinimumWidth(520)
 
         info = PLATFORMS[platform]
@@ -462,7 +495,9 @@ class ArchivePicker(QDialog):
             "UTT needs the game archive before it can list or preview textures. "
             "The archive will be extracted into a local cache folder beside UTT.\n\n"
             f"Platform: {info['name']} — extracted files will be stored as "
-            f".{info['extension']} files under cache\\{platform}."
+            f".{info['extension']} files under cache\\{platform}.\n\n"
+            "You can close this window to skip it — the app still works, "
+            "you just won't have textures or models from the archive."
         ))
         row = QHBoxLayout()
         self.path_label = QLabel("No archive selected")
@@ -522,10 +557,12 @@ class MainWindow(QMainWindow):
         self.unpack_progress: QProgressDialog | None = None
         self.repack_progress: QProgressDialog | None = None
         self._rpcs3 = None
+        self._attached = None
         self._character_items: list = []
         self._character_from_save = False
         self._character_model_hex = ""
         self._character_texture: PSGTx | None = None
+        self._character_rx2_image = None
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(
@@ -601,7 +638,7 @@ class MainWindow(QMainWindow):
         )
 
         self.model_tree = QTreeWidget()
-        self.model_tree.setHeaderLabels(["Model folder / PSG file"])
+        self.model_tree.setHeaderLabels([f"Model folder / {self.platform_info['label']} file"])
         self.model_tree.setMinimumWidth(300)
         self.model_tree.itemSelectionChanged.connect(self._on_texture_selected)
         self.model_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -650,7 +687,7 @@ class MainWindow(QMainWindow):
         model_page_layout = QHBoxLayout(self.model_page)
         model_page_layout.setContentsMargins(0, 0, 0, 0)
         self.model_splitter = QSplitter(Qt.Orientation.Horizontal)
-        self.model_preview = ModelPreview()
+        self.model_preview = ModelPreview(file_label=self.platform_info["label"])
         self.model_preview.export_requested.connect(self._export_model)
         self.model_splitter.addWidget(self.model_tree)
         self.model_splitter.addWidget(self.model_preview)
@@ -914,8 +951,9 @@ class MainWindow(QMainWindow):
         return page
 
     def _make_character_tab(self) -> QWidget:
-        """Live Skate 3 character items: read the recipe from RPCS3 memory and
-        preview the worn models/textures from the local cache."""
+        """Live Skate 3 character items: read the recipe from the running game
+        (RPCS3 for PS3; skate3recomp or Xenia for Xbox) and preview the worn
+        models/textures from the local cache."""
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 16, 16, 16)
@@ -923,13 +961,13 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(8)
-        self.rpcs3_status = QLabel("RPCS3 not attached")
-        self.rpcs3_status.setObjectName("status")
-        header.addWidget(self.rpcs3_status, 1)
-        attach_btn = QPushButton("Attach to RPCS3")
-        attach_btn.clicked.connect(self._attach_rpcs3)
+        self.attach_status = QLabel("Not attached")
+        self.attach_status.setObjectName("status")
+        header.addWidget(self.attach_status, 1)
+        attach_btn = QPushButton("Attach")
+        attach_btn.clicked.connect(self._attach_target)
         header.addWidget(attach_btn)
-        self.character_scan_button = QPushButton("Scan for Models and Textures")
+        self.character_scan_button = QPushButton("Scan")
         self.character_scan_button.clicked.connect(self._scan_character)
         header.addWidget(self.character_scan_button)
         self.character_open_button = QPushButton("Open Output Folder")
@@ -951,7 +989,7 @@ class MainWindow(QMainWindow):
 
         self.character_stack = QStackedWidget()
 
-        self.character_model_preview = ModelPreview()
+        self.character_model_preview = ModelPreview(file_label=self.platform_info["label"])
         self.character_model_preview.export_requested.connect(self._export_model)
         self.character_stack.addWidget(self.character_model_preview)
 
@@ -997,6 +1035,7 @@ class MainWindow(QMainWindow):
             QFrame#titleBar { background: #2b2c2f; border-bottom: 1px solid #3c4043; }
             QFrame#titleBar QLabel { background: transparent; }
             QLabel#windowTitle { color: #d9dce1; font-size: 13px; font-weight: 600; }
+            QLabel#versionLabel { color: #8a919c; font-size: 11px; margin-top: 2px; }
             QPushButton#creditsButton, QPushButton#settingsButton { background: transparent; color: #aeb4bd; border-radius: 8px; padding: 6px 11px; font-weight: 500; }
             QPushButton#creditsButton:hover, QPushButton#settingsButton:hover { background: #3c4043; color: #ffffff; }
             QPushButton#titleWindowButton, QPushButton#titleCloseButton { background: transparent; border-radius: 0; padding: 0; font-size: 17px; font-weight: 400; }
@@ -1456,7 +1495,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             self._show_error(str(exc))
 
-    def _export_model(self, model, source_path):
+    def _export_model(self, model, source_path, with_skin=False):
         if model is None:
             return
         default_name = source_path.stem if source_path else "model"
@@ -1468,7 +1507,7 @@ class MainWindow(QMainWindow):
         if not path:
             return
         self._start_worker(
-            lambda: export_gltf(model, path),
+            lambda: export_gltf(model, path, with_skin=with_skin),
             lambda result: QMessageBox.information(self, APP_TITLE, f"Model exported:\n{result}"),
         )
 
@@ -1487,22 +1526,40 @@ class MainWindow(QMainWindow):
             return True
         return any(self._find_psg(hex_name) for hex_name in item.get("textures", {}).values())
 
+    def _attach_target(self):
+        """Attach to the platform's game process: RPCS3 on PS3, skate3recomp
+        or Xenia on Xbox (auto-detected)."""
+        if self.platform == "xbx":
+            try:
+                proc, label = recipe.find_target()
+            except recipe.GameNotFoundError as exc:
+                self.attach_status.setText("Not attached")
+                self._show_error(str(exc))
+                return
+            self._attached = proc
+            self.attach_status.setText(f"Attached to {label} — process {proc.process_id}")
+            return
+        self._attach_rpcs3()
+
     def _attach_rpcs3(self):
         try:
             self._rpcs3 = recipe.find_rpcs3()
-        except recipe.RPCS3NotFoundError as exc:
-            self.rpcs3_status.setText("RPCS3 not attached")
+        except recipe.GameNotFoundError as exc:
+            self.attach_status.setText("RPCS3 not attached")
             self._show_error(str(exc))
             return
-        self.rpcs3_status.setText(
+        self.attach_status.setText(
             f"Attached to RPCS3 — process {self._rpcs3.process_id}"
         )
 
+    def _character_output_dir(self) -> Path:
+        return recipe.get_base_path() / ("output_xbx" if self.platform == "xbx" else "output")
+
     def _scan_character(self):
         self.character_scan_button.setEnabled(False)
-        self.rpcs3_status.setText("Scanning character…")
+        self.attach_status.setText("Scanning character…")
         self._start_worker(
-            lambda: recipe.scan_and_save(recipe.get_base_path() / "output"),
+            lambda: recipe.scan_and_save(self._character_output_dir(), self.platform),
             self._character_scan_finished,
             self._character_scan_failed,
         )
@@ -1510,7 +1567,7 @@ class MainWindow(QMainWindow):
     def _character_scan_finished(self, result):
         self._populate_character_tree(result["items"], result["output_folder"])
         self.character_scan_button.setEnabled(True)
-        self.rpcs3_status.setText(
+        self.attach_status.setText(
             f"Found {len(self._character_items)} items — saved to {result['txt_path']}"
         )
 
@@ -1554,10 +1611,8 @@ class MainWindow(QMainWindow):
         self.character_open_button.setEnabled(True)
 
     def _load_saved_character_items(self):
-        """Reuse the previous scan when output\\current_items.txt exists."""
-        if self.platform != "ps3":
-            return
-        txt_path = recipe.get_base_path() / "output" / "current_items.txt"
+        """Reuse the previous scan when the platform's current_items.txt exists."""
+        txt_path = self._character_output_dir() / "current_items.txt"
         if not txt_path.is_file():
             return
         try:
@@ -1568,13 +1623,13 @@ class MainWindow(QMainWindow):
             return
         self._character_from_save = True
         self._populate_character_tree(items, txt_path.parent)
-        self.rpcs3_status.setText(
+        self.attach_status.setText(
             f"Loaded {len(items)} items from current_items.txt — rescan to refresh"
         )
 
     def _character_scan_failed(self, details: str):
         self.character_scan_button.setEnabled(True)
-        self.rpcs3_status.setText("Scan failed")
+        self.attach_status.setText("Scan failed")
         self._show_error(details)
 
     def _on_character_item_selected(self):
@@ -1592,6 +1647,7 @@ class MainWindow(QMainWindow):
             hex_name, path = data[1], data[2]
             if path is None:
                 self._character_texture = None
+                self._character_rx2_image = None
                 self.character_texture_label.setPixmap(QPixmap())
                 self.character_texture_label.setText(
                     "Texture not found in cache — unpack createacharacter.big to preview."
@@ -1599,13 +1655,20 @@ class MainWindow(QMainWindow):
                 self.character_selected_label.setText(hex_name or "")
                 return
             self.character_texture_label.setText("Loading preview…")
-            self._start_worker(
-                lambda: (hex_name, PSGTx(str(path))),
-                self._character_texture_loaded,
-            )
+            if Path(path).suffix.lower() == ".rx2":
+                self._start_worker(
+                    lambda: (hex_name, rx2_preview_image(Path(path))),
+                    self._character_texture_loaded,
+                )
+            else:
+                self._start_worker(
+                    lambda: (hex_name, PSGTx(str(path))),
+                    self._character_texture_loaded,
+                )
             return
         model_hex, path = data[1], data[2]
         self._character_texture = None
+        self._character_rx2_image = None
         self.character_texture_label.setPixmap(QPixmap())
         self.character_texture_label.setText("Select a texture to preview")
         self.character_selected_label.setText("No texture selected")
@@ -1641,17 +1704,28 @@ class MainWindow(QMainWindow):
         data = node.data(0, Qt.ItemDataRole.UserRole)
         if not data or data[0] != "texture" or data[1] != hex_name:
             return
-        self._character_texture = texture
+        if isinstance(texture, PSGTx):
+            self._character_texture = texture
+            self._character_rx2_image = None
+        else:
+            self._character_texture = None
+            self._character_rx2_image = texture
         self.character_selected_label.setText(hex_name)
         self._refresh_character_texture_preview()
         self.character_stack.setCurrentWidget(self.character_texture_page)
 
     def _refresh_character_texture_preview(self):
-        if self._character_texture is None:
+        image = None
+        if self._character_rx2_image is not None:
+            image = self._character_rx2_image
+            if self.character_force_opaque.isChecked():
+                image = _force_opaque(image)
+        elif self._character_texture is not None:
+            image = self._character_texture.get_tx_image(
+                self.character_force_opaque.isChecked()
+            )
+        if image is None:
             return
-        image = self._character_texture.get_tx_image(
-            self.character_force_opaque.isChecked()
-        )
         pixmap = QPixmap.fromImage(ImageQt(image.convert("RGBA")))
         self.character_texture_label.setPixmap(pixmap.scaled(
             self.character_texture_label.size(),
@@ -1660,7 +1734,7 @@ class MainWindow(QMainWindow):
         ))
 
     def _open_character_output(self):
-        folder = recipe.get_base_path() / "output"
+        folder = self._character_output_dir()
         if not folder.is_dir():
             return
         if sys.platform == "win32":
@@ -2028,11 +2102,42 @@ class MainWindow(QMainWindow):
         note.setObjectName("convertDescription")
         layout.addWidget(note)
 
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setStyleSheet("color: #3c4043;")
+        layout.addWidget(separator)
+
+        export_header = QLabel("glTF export")
+        export_header.setObjectName("dialogTitle")
+        layout.addWidget(export_header)
+
+        saved_mode = get_saved_export_mode()
+        self.export_bones_check = QCheckBox("Always export glTF with bones")
+        self.export_bones_check.setChecked(saved_mode == "bones")
+        self.export_bones_check.toggled.connect(
+            lambda checked: checked and self.export_mesh_check.setChecked(False)
+        )
+        self.export_mesh_check = QCheckBox("Always export glTF mesh")
+        self.export_mesh_check.setChecked(saved_mode == "mesh")
+        self.export_mesh_check.toggled.connect(
+            lambda checked: checked and self.export_bones_check.setChecked(False)
+        )
+        layout.addWidget(self.export_bones_check)
+        layout.addWidget(self.export_mesh_check)
+
+        export_note = QLabel(
+            "When a model with a skeleton is loaded, the export mode is "
+            "preselected from this choice. You can still change it per export."
+        )
+        export_note.setWordWrap(True)
+        export_note.setObjectName("convertDescription")
+        layout.addWidget(export_note)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(dialog.reject)
-        apply_button = QPushButton("Switch platform")
+        apply_button = QPushButton("Apply")
         apply_button.clicked.connect(dialog.accept)
         buttons.addWidget(cancel)
         buttons.addWidget(apply_button)
@@ -2040,6 +2145,11 @@ class MainWindow(QMainWindow):
 
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
+        save_export_mode(
+            "bones"
+            if self.export_bones_check.isChecked()
+            else "mesh" if self.export_mesh_check.isChecked() else ""
+        )
         target = combo.currentData()
         if target == self.platform:
             return
