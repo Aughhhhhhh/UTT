@@ -12,17 +12,19 @@ from pathlib import Path
 
 from PIL import Image
 from PIL.ImageQt import ImageQt
-from PyQt6.QtCore import QEvent, QObject, QRect, QRegularExpression, Qt, QThread, pyqtSignal
+from PyQt6.QtCore import QEvent, QObject, QRect, QRegularExpression, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QGuiApplication, QPixmap, QRegularExpressionValidator
 from PyQt6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDoubleSpinBox, QFileDialog, QFrame,
     QGraphicsBlurEffect, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressDialog,
+    QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar,
+    QProgressDialog,
     QPushButton, QSizePolicy, QSlider, QSpinBox, QSplitter, QStackedWidget,
     QTabWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 import recipe
+import updater
 
 from archive_manager import ArchiveManager
 from gltf_exporter import export_gltf
@@ -32,7 +34,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "1.1.8"
+APP_VERSION = "1.1.9"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -428,6 +430,31 @@ def save_export_mode(mode: str) -> None:
         pass
 
 
+def skip_update_version_file() -> Path:
+    return working_dir() / "skip_update_version.txt"
+
+
+def get_skipped_update_version() -> str:
+    """Return the version the user asked to never be prompted about."""
+    try:
+        return skip_update_version_file().read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def save_skipped_update_version(version: str) -> None:
+    if not version:
+        try:
+            skip_update_version_file().unlink()
+        except OSError:
+            pass
+        return
+    try:
+        skip_update_version_file().write_text(version, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def choose_platform(parent=None) -> str:
     """Return the chosen platform, showing the picker only when none is saved."""
     saved = get_saved_platform()
@@ -523,6 +550,159 @@ class ArchivePicker(QDialog):
         self.continue_button.setEnabled(True)
 
 
+class UpdateDialog(QDialog):
+    """Ask whether to install a newer UTT release found on GitHub."""
+
+    def __init__(self, parent=None, current: str = "", release=None):
+        super().__init__(parent)
+        self.install = False
+        self.dont_ask_again = False
+        self.setWindowTitle("Update available")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel("A new version of UTT is available")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        version_row = QLabel(
+            f"Current version: {current}   →   New version: {release['version']}"
+        )
+        version_row.setObjectName("convertDescription")
+        layout.addWidget(version_row)
+
+        if release.get("body"):
+            layout.addWidget(QLabel("What's new:"))
+            changelog = QPlainTextEdit()
+            changelog.setReadOnly(True)
+            changelog.setPlainText(release["body"])
+            changelog.setMaximumHeight(200)
+            layout.addWidget(changelog)
+
+        self.skip_check = QCheckBox("Don't ask again about this version")
+        layout.addWidget(self.skip_check)
+
+        row = QHBoxLayout()
+        row.addStretch(1)
+        later = QPushButton("Later")
+        later.clicked.connect(self.reject)
+        install_button = QPushButton("Update now")
+        install_button.clicked.connect(self.accept)
+        row.addWidget(later)
+        row.addWidget(install_button)
+        layout.addLayout(row)
+
+    def accept(self):
+        self.install = True
+        self.dont_ask_again = self.skip_check.isChecked()
+        super().accept()
+
+
+class _UpdateDownloadWorker(QObject):
+    progress = pyqtSignal(int, int)
+    finished = pyqtSignal(object)
+    failed = pyqtSignal(str)
+    cancelled = pyqtSignal()
+
+    def __init__(self, url: str, dest: str, expected_size: int = 0):
+        super().__init__()
+        self.url = url
+        self.dest = dest
+        self.expected_size = expected_size
+        self.cancel_requested = False
+
+    def run(self):
+        try:
+            def on_progress(done, total):
+                self.progress.emit(done, total if total else -1)
+                return not self.cancel_requested
+
+            updater.download_file(
+                self.url,
+                self.dest,
+                expected_size=self.expected_size,
+                progress=on_progress,
+            )
+            self.finished.emit(self.dest)
+        except updater.UpdateCancelled:
+            self.cancelled.emit()
+        except Exception:
+            self.failed.emit(traceback.format_exc())
+
+
+class UpdateDownloadDialog(QDialog):
+    """Modal progress dialog for downloading the update installer."""
+
+    def __init__(self, parent=None, url: str = "", dest: str = "",
+                 expected_size: int = 0):
+        super().__init__(parent)
+        self.result_path: Path | None = None
+        self.error: str | None = None
+        self.cancelled = False
+        self.setWindowTitle("Downloading update")
+        self.setModal(True)
+        self.setMinimumWidth(430)
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+
+        title = QLabel("Downloading the update…")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+
+        self.file_label = QLabel(Path(dest).name)
+        self.file_label.setObjectName("convertDescription")
+        layout.addWidget(self.file_label)
+
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 0)
+        layout.addWidget(self.progress_bar)
+
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.clicked.connect(self._cancel_clicked)
+        layout.addWidget(self.cancel_button)
+
+        self._thread = QThread(self)
+        self._worker = _UpdateDownloadWorker(url, dest, expected_size)
+        self._worker.moveToThread(self._thread)
+        self._thread.started.connect(self._worker.run)
+        self._worker.progress.connect(self._on_progress)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.cancelled.connect(self._on_cancelled)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.failed.connect(self._thread.quit)
+        self._worker.cancelled.connect(self._thread.quit)
+        self._thread.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.start()
+
+    def _on_progress(self, done: int, total: int):
+        if total > 0:
+            if self.progress_bar.maximum() == 0:
+                self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(int(done * 100 / total))
+        else:
+            self.progress_bar.setRange(0, 0)
+
+    def _on_finished(self, path):
+        self.result_path = Path(path)
+        self.accept()
+
+    def _on_failed(self, details: str):
+        self.error = details
+        self.reject()
+
+    def _on_cancelled(self):
+        self.cancelled = True
+        self.reject()
+
+    def _cancel_clicked(self):
+        self.cancel_button.setEnabled(False)
+        self._worker.cancel_requested = True
+
+
 class MainWindow(QMainWindow):
     def __init__(self, model_loader, platform: str = "ps3"):
         super().__init__()
@@ -563,6 +743,7 @@ class MainWindow(QMainWindow):
         self._character_model_hex = ""
         self._character_texture: PSGTx | None = None
         self._character_rx2_image = None
+        self._update_checking = False
 
         self.setWindowTitle(APP_TITLE)
         self.setWindowFlags(
@@ -576,6 +757,8 @@ class MainWindow(QMainWindow):
         self._load_catalog()
         self._load_saved_character_items()
         self._restore_cache_or_request_archive()
+        if getattr(sys, "frozen", False):
+            QTimer.singleShot(1500, self._check_for_updates)
 
     def _build_ui(self):
         shell = QWidget()
@@ -2133,6 +2316,20 @@ class MainWindow(QMainWindow):
         export_note.setObjectName("convertDescription")
         layout.addWidget(export_note)
 
+        separator = QFrame()
+        separator.setFrameShape(QFrame.Shape.HLine)
+        separator.setStyleSheet("color: #3c4043;")
+        layout.addWidget(separator)
+
+        update_row = QHBoxLayout()
+        update_row.setSpacing(12)
+        update_row.addWidget(QLabel(f"Version {APP_VERSION}"))
+        update_row.addStretch(1)
+        check_button = QPushButton("Check for updates")
+        check_button.clicked.connect(lambda: self._check_for_updates(manual=True))
+        update_row.addWidget(check_button)
+        layout.addLayout(update_row)
+
         buttons = QHBoxLayout()
         buttons.addStretch(1)
         cancel = QPushButton("Cancel")
@@ -2155,6 +2352,101 @@ class MainWindow(QMainWindow):
             return
         save_platform(target)
         self._restart_app()
+
+    def _check_for_updates(self, manual: bool = False):
+        """Look up the newest GitHub release; prompt when it is newer.
+
+        Manual checks (Settings) always report the outcome. The startup
+        check stays silent unless an update is actually available.
+        """
+        if self._update_checking:
+            return
+        self._update_checking = True
+        self._start_worker(
+            updater.fetch_latest,
+            on_success=lambda release: self._update_fetch_done(release, manual),
+            on_failure=lambda details: self._update_fetch_failed(details, manual),
+        )
+
+    def _update_fetch_done(self, release, manual: bool):
+        self._update_checking = False
+        if release is None:
+            if manual:
+                QMessageBox.information(
+                    self, APP_TITLE,
+                    "You're up to date — no newer version is available.",
+                )
+            return
+        if not updater.is_newer(release["version"], APP_VERSION):
+            if manual:
+                QMessageBox.information(
+                    self, APP_TITLE,
+                    f"You're up to date — you are on the latest version "
+                    f"({APP_VERSION}).",
+                )
+            return
+        if not manual and get_skipped_update_version() == release["version"]:
+            return
+        dialog = UpdateDialog(self, APP_VERSION, release)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.dont_ask_again:
+            save_skipped_update_version(release["version"])
+        self._install_update(release)
+
+    def _update_fetch_failed(self, _details: str, manual: bool):
+        self._update_checking = False
+        if manual:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "Couldn't check for updates. Check your internet connection "
+                "and try again.",
+            )
+
+    def _install_update(self, release):
+        asset = updater.find_installer_asset(release)
+        if asset is None:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "The release doesn't include an installer file.\n"
+                f"Open it in your browser: {release['html_url']}",
+            )
+            return
+        destination = Path(tempfile.gettempdir()) / asset["name"]
+        dialog = UpdateDownloadDialog(
+            self, url=asset["url"], dest=str(destination),
+            expected_size=asset["size"],
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        if dialog.error is not None:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                "The update download failed.\n"
+                + dialog.error.splitlines()[-1],
+            )
+            return
+        self._apply_update(dialog.result_path)
+
+    def _apply_update(self, installer_path):
+        if not getattr(sys, "frozen", False):
+            QMessageBox.information(
+                self, APP_TITLE,
+                "Running from source — the downloaded installer is ready at:\n"
+                f"{installer_path}",
+            )
+            return
+        try:
+            subprocess.Popen([
+                str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES",
+            ])
+        except OSError:
+            QMessageBox.warning(
+                self, APP_TITLE,
+                f"Couldn't start the installer:\n{installer_path}",
+            )
+            return
+        self.close()
 
     def _restart_app(self):
         try:

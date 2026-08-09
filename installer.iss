@@ -1,5 +1,5 @@
 #define AppName "UTT"
-#define AppVersion "1.1.8"
+#define AppVersion "1.1.9"
 #define AppExeName "UTT.exe"
 
 [Setup]
@@ -53,4 +53,4 @@ Root: HKCU; Subkey: "Software\Classes\UTT.rx2\shell\open\command"; ValueType: st
 Root: HKCU; Subkey: "Software\Classes\UTT.psg\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\UTT.exe"" ""%1"""; Flags: uninsdeletevalue
 
 [Run]
-Filename: "{app}\{#AppExeName}"; Description: "Launch UTT"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\{#AppExeName}"; Description: "Launch UTT"; Flags: nowait postinstall
