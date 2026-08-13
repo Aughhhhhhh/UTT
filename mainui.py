@@ -42,7 +42,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -3676,6 +3676,30 @@ class MainWindow(QMainWindow):
             return
         self._apply_update(dialog.result_path)
 
+    def _fresh_instance_env(self) -> dict:
+        """Child env that spawns a new, independent PyInstaller instance.
+
+        A frozen onefile app passes its private _PYI_* variables (including
+        the extracted _MEI temp dir) to anything it spawns. The installer
+        inherits them and passes them on to the new UTT.exe it launches, whose
+        bootloader then mistakes itself for a worker of the old instance,
+        reuses the old (already deleted) temp dir and fails with
+        "Failed to load Python DLL ..._MEIxxxx\\python313.dll".
+        Stripping those variables and setting PYINSTALLER_RESET_ENVIRONMENT
+        forces a fresh top-level instance that unpacks its own temp dir.
+        """
+        env = os.environ.copy()
+        for name in (
+            "_MEIPASS2",
+            "_PYI_ARCHIVE_FILE",
+            "_PYI_APPLICATION_HOME_DIR",
+            "_PYI_PARENT_PROCESS_LEVEL",
+            "_PYI_SPLASH_IPC",
+        ):
+            env.pop(name, None)
+        env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
+        return env
+
     def _apply_update(self, installer_path):
         if not getattr(sys, "frozen", False):
             QMessageBox.information(
@@ -3685,9 +3709,10 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            subprocess.Popen([
-                str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES",
-            ])
+            subprocess.Popen(
+                [str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES"],
+                env=self._fresh_instance_env(),
+            )
         except OSError:
             QMessageBox.warning(
                 self, APP_TITLE,
@@ -3709,6 +3734,7 @@ class MainWindow(QMainWindow):
             subprocess.Popen(
                 command,
                 cwd=str(Path(__file__).resolve().parent),
+                env=self._fresh_instance_env(),
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             )
         except OSError:
