@@ -1,6 +1,7 @@
 from .errors import PSGDataError, PSGError, PSGFormatError
 from .model import Bone, MaterialParameter, Mesh, PSGModel, VertexAttribute
 from .parser import (
+    extract_material_textures,
     is_psg_model,
     is_rx2_model,
     load_model,
@@ -11,7 +12,7 @@ from .parser import (
     parse_rx2,
 )
 
-__version__ = "1.0.0"
+__version__ = "2.0.0"
 
 __all__ = [
     "Bone",
@@ -22,6 +23,7 @@ __all__ = [
     "PSGFormatError",
     "PSGModel",
     "VertexAttribute",
+    "extract_material_textures",
     "is_psg_model",
     "is_rx2_model",
     "load_model",

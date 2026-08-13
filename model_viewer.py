@@ -40,6 +40,22 @@ _GL_FLOAT = 0x1406
 
 SUBDIVISION_TRIANGLE_LIMIT = 50_000
 
+_DEFAULT_CLEAR = (0.094, 0.098, 0.106)
+
+
+def _theme_clear_color() -> tuple[float, float, float]:
+    """Clear colour for the 3D viewport, blended from the active theme's
+    gradient so the preview matches the window. Falls back to the classic
+    dark grey when the theme cannot be resolved."""
+    try:
+        from mainui import get_theme
+        top, bottom = get_theme()["gradient"]
+        top_rgb = [int(top[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+        bottom_rgb = [int(bottom[i:i + 2], 16) / 255.0 for i in (1, 3, 5)]
+        return tuple((a + b) / 2.0 for a, b in zip(top_rgb, bottom_rgb))
+    except Exception:
+        return _DEFAULT_CLEAR
+
 _VERTEX_SHADER = """
 #version 120
 attribute vec3 a_position;
@@ -272,7 +288,8 @@ class _GlViewport(QOpenGLWidget):
     def paintGL(self) -> None:
         gl = QOpenGLFunctions_2_0()
         gl.initializeOpenGLFunctions()
-        gl.glClearColor(0.094, 0.098, 0.106, 1.0)
+        r, g, b = _theme_clear_color()
+        gl.glClearColor(r, g, b, 1.0)
         gl.glClear(_GL_COLOR_BUFFER_BIT | _GL_DEPTH_BUFFER_BIT)
 
         if self._needs_upload:

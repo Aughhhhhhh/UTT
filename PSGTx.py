@@ -9,6 +9,8 @@ import struct
 import io
 from PIL import Image
 
+from alpha_mask import apply_alpha_mask
+
 class PSGTx:
     def __init__(self, file_source):
         """
@@ -90,37 +92,60 @@ class PSGTx:
         # Load and ensure it has an Alpha channel (RGBA) for potential modifications
         self._raw_image = Image.open(io.BytesIO(full_dds_file)).convert("RGBA")
 
-    def get_tx_image(self, force_opaque: bool = False) -> Image.Image:
+    def get_tx_image(self, force_opaque: bool = False, alpha_mask: bool = False,
+                     alpha_mask_invert: bool = False, alpha_mask_mix: bool = False) -> Image.Image:
         """
         Returns a Pillow Image object of the texture.
         
         :param force_opaque: If True, boosts all visible pixels' alpha to 255 
                              to fix transparency bleed without ruining the background.
+        :param alpha_mask: If True, replaces the alpha channel with the
+                           texture's own luminance (the Alpha Mask plugin port)
+                           to remove DXT5 alpha grain and transparent dots.
+        :param alpha_mask_invert: Invert the mask before applying.
+        :param alpha_mask_mix: Blend the mask with the original alpha instead
+                               of replacing it.
         :return: PIL.Image object
+
+        The alpha mask is applied first, then force_opaque runs last, so
+        checking both removes the DXT5 alpha grain AND leaves the image
+        fully opaque (only pure-black mask pixels stay transparent).
         """
         if not self._raw_image:
             raise RuntimeError("No texture data loaded.")
 
-        if not force_opaque:
-            return self._raw_image.copy()
+        img = self._raw_image.copy()
 
-        # Split channels and manipulate only the alpha channel
-        r, g, b, a = self._raw_image.split()
-        
-        # If alpha is >= 5, make it fully solid (255). 
-        # Keeps < 5 as 0 to hide DXT compression background artifacts.
-        new_a = a.point(lambda p: 0 if p < 5 else 255)
-        
-        return Image.merge("RGBA", (r, g, b, new_a))
+        if alpha_mask:
+            img = apply_alpha_mask(
+                img, img, invert=alpha_mask_invert, alpha_mix=alpha_mask_mix
+            )
 
-    def export_tx(self, output_path: str, force_opaque: bool = False):
+        if force_opaque:
+            # Split channels and manipulate only the alpha channel
+            r, g, b, a = img.split()
+
+            # If alpha is >= 5, make it fully solid (255). 
+            # Keeps < 5 as 0 to hide DXT compression background artifacts.
+            new_a = a.point(lambda p: 0 if p < 5 else 255)
+
+            img = Image.merge("RGBA", (r, g, b, new_a))
+
+        return img
+
+    def export_tx(self, output_path: str, force_opaque: bool = False,
+                  alpha_mask: bool = False, alpha_mask_invert: bool = False,
+                  alpha_mask_mix: bool = False):
         """
         Exports the texture to a standard image file format (PNG, JPG, TGA, BMP).
         
         :param output_path: The file path to save the image (e.g., 'output.png')
         :param force_opaque: If True, applies the solid alpha fix before exporting.
+        :param alpha_mask: If True, applies the Alpha Mask plugin fix.
+        :param alpha_mask_invert: Invert the mask before applying.
+        :param alpha_mask_mix: Blend the mask with the original alpha.
         """
-        img = self.get_tx_image(force_opaque)
+        img = self.get_tx_image(force_opaque, alpha_mask, alpha_mask_invert, alpha_mask_mix)
 
         # JPGs crash if you try to save an RGBA image. Convert to RGB automatically.
         if output_path.lower().endswith(('.jpg', '.jpeg')):

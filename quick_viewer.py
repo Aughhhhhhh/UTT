@@ -8,21 +8,24 @@ PNG or models as GLB — no game archive or cache required.
 from __future__ import annotations
 
 import shutil
-import subprocess
 import sys
 import traceback
 from pathlib import Path
 
 from PIL.ImageQt import ImageQt
 from PyQt6.QtCore import Qt, QThread
-from PyQt6.QtGui import QGuiApplication, QPixmap
+from PyQt6.QtGui import QColor, QGuiApplication, QLinearGradient, QPainter, QPixmap
 from PyQt6.QtWidgets import (
-    QCheckBox, QFileDialog, QHBoxLayout, QLabel, QListWidget,
-    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton,
+    QCheckBox, QDialog, QFileDialog, QFrame, QHBoxLayout, QLabel, QListWidget,
+    QListWidgetItem, QMainWindow, QMenu, QMessageBox, QPushButton, QRadioButton,
     QSplitter, QVBoxLayout, QWidget,
 )
 
-from mainui import APP_TITLE, Worker, _force_opaque
+from mainui import (
+    APP_TITLE, DEFAULT_THEME, THEMES, Worker, _force_opaque, TextureZoomPreview,
+    get_saved_theme, get_theme, reveal_in_explorer, save_theme,
+)
+from alpha_mask import apply_alpha_mask
 from model_viewer import ModelPreview
 from PSGTx import PSGTx
 
@@ -91,11 +94,12 @@ def _describe_model(path: Path, model=None) -> str:
     )
 
 
-def preview_texture(path: Path, opaque: bool) -> object | None:
+def preview_texture(path: Path, opaque: bool, alpha_mask: bool = False) -> object | None:
     """Decode a texture file into a PIL image, or None when it has none.
 
     Uses the same parsers as the main tool: ``rx2_parser`` for RX2 files
-    (Xbox 360) and ``PSGTx`` for PSG files (PS3).
+    (Xbox 360) and ``PSGTx`` for PSG files (PS3). The alpha mask is applied
+    first, then the opacity fix, mirroring the main tool.
     """
     if path.suffix.lower() == ".rx2":
         from rx2_parser import parse_rx2
@@ -108,12 +112,14 @@ def preview_texture(path: Path, opaque: bool) -> object | None:
                 image = texture.to_pil()
             except Exception:
                 continue
+            if alpha_mask:
+                image = apply_alpha_mask(image, image)
             if opaque:
                 image = _force_opaque(image)
             return image
         return None
     try:
-        return PSGTx(str(path)).get_tx_image(opaque)
+        return PSGTx(str(path)).get_tx_image(opaque, alpha_mask=alpha_mask)
     except Exception:
         return None
 
@@ -145,8 +151,15 @@ class QuickFileViewer(QMainWindow):
         self._current_kind = "other"
         self._current_path: Path | None = None
 
-        accent = "#107c10" if self.opened_path.suffix.lower() == ".rx2" else "#5b86e5"
-        self._apply_style(accent)
+        self.platform_key = "xbx" if self.opened_path.suffix.lower() == ".rx2" else "ps3"
+        self.theme_name = get_saved_theme()
+        theme = get_theme(self.theme_name)
+        self.gradient_top, self.gradient_bottom = theme["gradient"]
+        self.surface = theme["surface"]
+        self.border = theme["border"]
+        self.line = theme["line"]
+        self.outline = theme["outline"]
+        self._apply_style()
 
         self.setWindowTitle("UTT — Ultimate Texture Toolkit")
         self.resize(980, 620)
@@ -156,10 +169,16 @@ class QuickFileViewer(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
 
+        header_row = QHBoxLayout()
+        header_row.setSpacing(12)
         header = QLabel(f"Folder: {self.folder}")
         header.setObjectName("folderLabel")
         header.setWordWrap(True)
-        root.addWidget(header)
+        header_row.addWidget(header, 1)
+        theme_button = QPushButton("Theme…")
+        theme_button.clicked.connect(self._choose_theme)
+        header_row.addWidget(theme_button)
+        root.addLayout(header_row)
 
         splitter = QSplitter(Qt.Orientation.Horizontal, central)
         root.addWidget(splitter, 1)
@@ -172,12 +191,9 @@ class QuickFileViewer(QMainWindow):
         right_layout = QVBoxLayout(right)
         right_layout.setContentsMargins(10, 0, 0, 0)
 
-        self.preview_label = QLabel("Select a file to preview")
-        self.preview_label.setObjectName("preview")
-        self.preview_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview_label.setMinimumHeight(420)
-        self.preview_label.setWordWrap(True)
-        right_layout.addWidget(self.preview_label, 1)
+        self.texture_preview = TextureZoomPreview()
+        self.texture_preview.setMinimumHeight(420)
+        right_layout.addWidget(self.texture_preview, 1)
 
         self.model_preview = ModelPreview()
         self.model_preview.export_requested.connect(self._export_loaded_model)
@@ -196,6 +212,16 @@ class QuickFileViewer(QMainWindow):
             "hiding DXT compression transparency bleed."
         )
         controls.addWidget(self.force_opaque)
+        self.alpha_mask_checkbox = QCheckBox("Fix alpha grain (Alpha Mask)")
+        self.alpha_mask_checkbox.setToolTip(
+            "Replaces the alpha channel with the texture's brightness (the "
+            "Alpha Mask Paint.NET plugin port). Removes DXT5 alpha grain and "
+            "transparent dots. Applied before the opacity fix, so keeping both "
+            "checked gives clean full opacity; dark texture areas only go "
+            "translucent when this is on and the opacity fix is off. Disable "
+            "for mask-style textures (decal2, blurmask)."
+        )
+        controls.addWidget(self.alpha_mask_checkbox)
         controls.addStretch(1)
         self.export_png_button = QPushButton("Export PNG…")
         self.export_png_button.setEnabled(False)
@@ -210,34 +236,130 @@ class QuickFileViewer(QMainWindow):
         self.file_list.currentItemChanged.connect(self._on_selection_changed)
         self.file_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.file_list.customContextMenuRequested.connect(self._show_context_menu)
-        self.force_opaque.toggled.connect(self._on_opaque_toggled)
+        self.force_opaque.toggled.connect(self._on_texture_options_toggled)
+        self.alpha_mask_checkbox.toggled.connect(self._on_texture_options_toggled)
         self.export_png_button.clicked.connect(self._export_png)
 
         self._populate()
         self._select_path(self.opened_path)
 
-    def _apply_style(self, accent: str) -> None:
+    def _apply_style(self) -> None:
+        theme = get_theme(self.theme_name)[self.platform_key]
+        accent = theme["accent"]
         self.setStyleSheet(
             """
-            QWidget { background: #202124; color: #f1f3f4; font-size: 14px; }
+            QWidget { color: #f1f3f4; font-size: 14px; }
             QLabel#folderLabel { font-weight: 600; padding: 4px; }
-            QListWidget#fileList { background: #2b2c2f; border: 1px solid #4a4d52; border-radius: 9px; padding: 4px; }
+            QListWidget#fileList { background: @surface; border: 1px solid @border; border-radius: 9px; padding: 4px; }
             QListWidget#fileList::item { padding: 5px; border-radius: 6px; }
             QListWidget#fileList::item:selected { background: @accent_dark; }
-            QLabel#preview { background: #18191b; border: 1px dashed #5f6368; border-radius: 16px; }
+            QLabel#preview { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 @gradient_top, stop:1 @gradient_bottom); border: 1px dashed @outline; border-radius: 16px; }
             QLabel#details, QLabel#modelDetails { color: #aeb4bd; }
             QLabel#modelTitle { font-weight: 600; }
             QPushButton { background: @accent; border: 0; border-radius: 16px; padding: 8px 15px; font-weight: 600; }
             QPushButton:hover { background: @accent_hover; }
             QPushButton:disabled { background: #45474b; color: #9aa0a6; }
             QCheckBox { padding: 4px; }
-            QMenu { background: #2b2c2f; border: 1px solid #4a4d52; }
+            QRadioButton { background: transparent; color: #f1f3f4; spacing: 8px; }
+            QRadioButton::indicator { width: 16px; height: 16px; border: 1px solid @border; border-radius: 8px; background: @surface; }
+            QRadioButton::indicator:checked { background: @accent_dark; border: 1px solid @accent_soft; }
+            QMenu { background: @surface; border: 1px solid @border; }
             QMenu::item:selected { background: @accent_dark; }
             """
+            .replace("@gradient_top", self.gradient_top)
+            .replace("@gradient_bottom", self.gradient_bottom)
+            .replace("@surface", self.surface)
+            .replace("@border", self.border)
+            .replace("@line", self.line)
+            .replace("@outline", self.outline)
+            .replace("@accent_hover", theme["hover"])
+            .replace("@accent_dark", theme["dark"])
+            .replace("@accent_soft", theme["soft"])
             .replace("@accent", accent)
-            .replace("@accent_hover", "#1e9e5a" if accent.startswith("#107c10") else "#7299ec")
-            .replace("@accent_dark", "#2d7a46" if accent.startswith("#107c10") else "#536d9f")
         )
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        gradient = QLinearGradient(0, 0, 0, self.height())
+        gradient.setColorAt(0.0, QColor(self.gradient_top))
+        gradient.setColorAt(1.0, QColor(self.gradient_bottom))
+        painter.fillRect(self.rect(), gradient)
+
+    def _choose_theme(self) -> None:
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Theme")
+        dialog.setModal(True)
+        dialog.setStyleSheet(
+            "QDialog { background: qlineargradient(x1:0, y1:0, x2:0, y2:1, "
+            f"stop:0 {self.gradient_top}, stop:1 {self.gradient_bottom}); }}"
+        )
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(12)
+        dialog.setMinimumWidth(340)
+        label = QLabel(
+            "Choose the background gradient. The accent (blue for PS3 files, "
+            "green for Xbox files) changes to match the theme."
+        )
+        label.setWordWrap(True)
+        label.setObjectName("details")
+        layout.addWidget(label)
+
+        theme_radios: dict[str, QRadioButton] = {}
+        selected_theme = get_saved_theme()
+        for name, theme in THEMES.items():
+            row = QHBoxLayout()
+            row.setSpacing(10)
+            radio = QRadioButton(theme["name"])
+            radio.setChecked(name == selected_theme)
+            swatch = QFrame()
+            swatch.setFixedSize(72, 22)
+            gradient_top, gradient_bottom = theme["gradient"]
+            swatch.setStyleSheet(
+                "QFrame { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, "
+                f"stop:0 {gradient_top}, stop:1 {gradient_bottom}); "
+                f"border: 1px solid {theme['border']}; border-radius: 5px; }}"
+            )
+            row.addWidget(radio)
+            row.addStretch(1)
+            row.addWidget(swatch)
+            layout.addLayout(row)
+            theme_radios[name] = radio
+
+        reset_button = QPushButton("Reset to default")
+        reset_button.clicked.connect(
+            lambda: theme_radios[DEFAULT_THEME].setChecked(True)
+        )
+        layout.addWidget(reset_button, 0, Qt.AlignmentFlag.AlignRight)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(dialog.reject)
+        apply_button = QPushButton("Apply")
+        apply_button.clicked.connect(dialog.accept)
+        buttons.addWidget(cancel)
+        buttons.addWidget(apply_button)
+        layout.addLayout(buttons)
+
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = next(
+            name for name, radio in theme_radios.items() if radio.isChecked()
+        )
+        if chosen == get_saved_theme():
+            return
+        save_theme(chosen)
+        self.theme_name = chosen
+        theme = THEMES[chosen]
+        self.gradient_top, self.gradient_bottom = theme["gradient"]
+        self.surface = theme["surface"]
+        self.border = theme["border"]
+        self.line = theme["line"]
+        self.outline = theme["outline"]
+        self._apply_style()
+        self.update()
 
     def _populate(self) -> None:
         try:
@@ -283,15 +405,18 @@ class QuickFileViewer(QMainWindow):
         self.export_png_button.setEnabled(False)
         self._current_image = None
         self._hide_model()
-        self.preview_label.setText("Loading…")
+        self.texture_preview.set_message("Loading…")
         self.info_label.setText("")
         self._run_task(
-            lambda: self._preview_file(path, self.force_opaque.isChecked()),
+            lambda: self._preview_file(
+                path, self.force_opaque.isChecked(),
+                self.alpha_mask_checkbox.isChecked(),
+            ),
             self._preview_finished,
         )
 
     @staticmethod
-    def _preview_file(path: Path, opaque: bool):
+    def _preview_file(path: Path, opaque: bool, alpha_mask: bool = False):
         kind, info = describe_file(path)
         payload = None
         if kind in MODEL_KINDS:
@@ -299,7 +424,7 @@ class QuickFileViewer(QMainWindow):
             if payload is not None:
                 info = _describe_model(path, payload)
         else:
-            payload = preview_texture(path, opaque)
+            payload = preview_texture(path, opaque, alpha_mask)
             if payload is None and "cas_db" in {part.lower() for part in path.parts}:
                 # Files under cas_db are models: fall back to the model parser
                 # when the texture decode produces nothing.
@@ -317,6 +442,7 @@ class QuickFileViewer(QMainWindow):
         self.info_label.setText(info)
         self.export_png_button.setEnabled(kind in TEXTURE_KINDS)
         self.force_opaque.setVisible(kind in TEXTURE_KINDS)
+        self.alpha_mask_checkbox.setVisible(kind in TEXTURE_KINDS)
         if kind in MODEL_KINDS and payload is not None:
             self._show_model(path, payload)
             return
@@ -327,39 +453,38 @@ class QuickFileViewer(QMainWindow):
             return
         self._current_image = None
         if kind in TEXTURE_KINDS:
-            self.preview_label.setText("No decodable texture found.")
+            self.texture_preview.set_message("No decodable texture found.")
         elif kind in MODEL_KINDS:
-            self.preview_label.setText("3D preview is not available.")
+            self.texture_preview.set_message("3D preview is not available.")
         else:
-            self.preview_label.setText("This file has no preview.")
+            self.texture_preview.set_message("This file has no preview.")
 
     def _show_model(self, path: Path, model) -> None:
-        self.preview_label.hide()
+        self.texture_preview.hide()
         self.model_preview.show()
         self.model_preview.set_model(path, model)
 
     def _hide_model(self) -> None:
         self.model_preview.hide()
-        self.preview_label.show()
+        self.texture_preview.show()
 
     def _show_image(self, image) -> None:
-        pixmap = QPixmap.fromImage(ImageQt(image.convert("RGBA")))
-        self.preview_label.setPixmap(pixmap.scaled(
-            self.preview_label.size(), Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        ))
+        self.texture_preview.set_image(image)
 
-    def _on_opaque_toggled(self) -> None:
+    def _on_texture_options_toggled(self) -> None:
         if self._current_path is None:
             return
         if self._current_kind in TEXTURE_KINDS:
-            self.preview_label.setText("Loading…")
+            self.texture_preview.set_message("Loading…")
             self._run_task(
-                lambda: preview_texture(self._current_path, self.force_opaque.isChecked()),
-                self._opaque_preview_finished,
+                lambda: preview_texture(
+                    self._current_path, self.force_opaque.isChecked(),
+                    self.alpha_mask_checkbox.isChecked(),
+                ),
+                self._options_preview_finished,
             )
 
-    def _opaque_preview_finished(self, image) -> None:
+    def _options_preview_finished(self, image) -> None:
         if image is None:
             return
         self._current_image = image
@@ -439,11 +564,7 @@ class QuickFileViewer(QMainWindow):
             QMessageBox.critical(self, APP_TITLE, str(exc))
 
     def _open_in_explorer(self, path: Path) -> None:
-        path = Path(path).resolve()
-        if sys.platform == "win32":
-            subprocess.Popen(f'explorer /select,"{path}"')
-        else:
-            subprocess.Popen(["xdg-open", str(path.parent)])
+        reveal_in_explorer(path)
 
     def _run_task(self, task, on_done) -> None:
         thread = QThread(self)

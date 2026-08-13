@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import struct
 from dataclasses import dataclass
 from pathlib import Path
@@ -961,3 +962,36 @@ def _read_cstring_with_end(data: bytes, offset: int) -> tuple[str, int]:
     if end < 0:
         raise PSGDataError(f"unterminated string at 0x{offset:X}")
     return data[offset:end].decode("utf-8", errors="replace"), end + 1
+
+
+_MATERIAL_CHANNELS = frozenset({
+    "diffuse", "normal", "specular", "alpha", "decal", "decal1", "decal2",
+    "decal3", "blurmask", "environment", "bump", "bumpmap", "emissive",
+    "glow", "tint", "overlay", "detail", "light", "refmap", "mask",
+    "ambient", "color", "env", "envmap", "incandescence",
+})
+
+_TEXTURE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.]*0x[0-9a-fA-F]{16}$")
+_WORD_SPLIT_RE = re.compile(r"[^A-Za-z0-9_.]+")
+
+
+def extract_material_textures(data: bytes) -> list[tuple[str, str]]:
+    """Find (channel, alias) pairs in the model's embedded Attribulator
+    material metadata, e.g. ("diffuse", "0x0000162b03e38818").  The alias is
+    always the trailing 18-character hex id (0x + 16 hex digits)."""
+    words = _WORD_SPLIT_RE.split(data.decode("latin-1", errors="ignore"))
+    entries: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for index in range(1, len(words)):
+        word = words[index]
+        if not _TEXTURE_TOKEN_RE.fullmatch(word):
+            continue
+        channel = words[index - 1].lower()
+        if channel not in _MATERIAL_CHANNELS:
+            continue
+        alias = word[-18:].lower()
+        entry = (channel, alias)
+        if entry not in seen:
+            seen.add(entry)
+            entries.append(entry)
+    return entries

@@ -48,9 +48,20 @@ def find_opened_file() -> Path | None:
     return None
 
 
+def _close_splash() -> None:
+    """Close the PyInstaller bootloader splash (no-op when running from source)."""
+    try:
+        import pyi_splash  # type: ignore[import-not-found]
+    except ImportError:
+        return
+    try:
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def main() -> int:
-    if not getattr(sys, "frozen", False):
-        _install_crash_logger()
+    _install_crash_logger()
     app = QApplication(sys.argv)
     app.setApplicationName("UTT")
     app.setOrganizationName("UTT")
@@ -59,6 +70,9 @@ def main() -> int:
     ico = Path(__file__).with_name("UTT.ico")
     if ico.exists():
         app.setWindowIcon(QIcon(str(ico)))
+    # The bootloader splash covered the heavy boot phase; close it before any
+    # modal (platform/archive picker) could end up hidden behind it.
+    _close_splash()
     opened_file = find_opened_file()
     if opened_file is not None:
         from quick_viewer import QuickFileViewer

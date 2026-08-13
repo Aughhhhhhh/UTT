@@ -25,6 +25,7 @@ set "STAGE=%CD%\build\_app_stage"
 
 python -m PyInstaller --noconfirm --clean --onefile --noupx --windowed --name UTT --icon "%CD%\UTT.ico" ^
   --version-file "%CD%\version_info.txt" ^
+  --splash "%CD%\splash.png" ^
   --distpath "%STAGE%" ^
   --workpath "%CD%\build\_pyinstaller" ^
   --specpath "%CD%\build\_pyinstaller" ^
@@ -49,8 +50,7 @@ rmdir /S /Q "%STAGE%"
 REM Remove any _internal left over from a previous onedir build.
 if exist "%CD%\build\_internal" rmdir /S /Q "%CD%\build\_internal"
 
-REM Crash logs are dev-only (written when running from source), so never
-REM leave a stale one in the folder that gets distributed.
+REM Never leave a stale crash log in the folder that gets distributed.
 if exist "%CD%\build\utt_crash.log" del /Q "%CD%\build\utt_crash.log"
 
 if not exist "%CD%\build\assets" mkdir "%CD%\build\assets"

@@ -26,7 +26,7 @@ def api_url() -> str:
 
 
 def parse_version(text: str) -> tuple:
-    """'v1.1.9' -> (1, 1, 9). Non-numeric chunks become 0."""
+    """'v2.0.0' -> (2, 0, 0). Non-numeric chunks become 0."""
     parts = []
     for chunk in text.strip().lstrip("vV").replace("-", ".").split("."):
         digits = "".join(char for char in chunk if char.isdigit())
