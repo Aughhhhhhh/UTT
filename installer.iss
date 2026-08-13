@@ -54,3 +54,7 @@ Root: HKCU; Subkey: "Software\Classes\UTT.psg\shell\open\command"; ValueType: st
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Launch UTT"; Flags: nowait postinstall
+
+[UninstallDelete]
+; Remove the settings file (utt_config.json) created next to the executable.
+Type: files; Name: "{app}\utt_config.json"
