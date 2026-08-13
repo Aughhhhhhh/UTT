@@ -3700,6 +3700,74 @@ class MainWindow(QMainWindow):
         env["PYINSTALLER_RESET_ENVIRONMENT"] = "1"
         return env
 
+    def _terminate_other_utts(self) -> list[int]:
+        """Force-kill every other UTT.exe process before a silent update.
+
+        A frozen onefile app runs as two processes: the bootloader parent
+        (splash/Tcl) and the app child. After the app exits, the parent can
+        intermittently hang in teardown, leaving a windowless zombie that
+        keeps UTT.exe open indefinitely. Inno Setup's CloseApplications
+        (RestartManager) cannot close such a process and aborts the silent
+        update, so the installer never runs. This terminates all other
+        UTT.exe processes — old zombies, hung bootloader parents, and any
+        other running UTT window — so the installer can replace the file.
+        """
+        killed: list[int] = []
+        if not getattr(sys, "frozen", False):
+            return killed
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.windll.kernel32
+            PROCESS_TERMINATE = 0x0001
+            TH32CS_SNAPPROCESS = 0x00000002
+
+            class PROCESSENTRY32(ctypes.Structure):
+                _fields_ = [
+                    ("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.POINTER(wintypes.ULONG)),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", wintypes.LONG),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260),
+                ]
+
+            own_pid = os.getpid()
+            snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+            if snapshot == -1:
+                return killed
+            entry = PROCESSENTRY32()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+            try:
+                if kernel32.Process32First(snapshot, ctypes.byref(entry)):
+                    while True:
+                        if (
+                            entry.th32ProcessID != own_pid
+                            and entry.szExeFile.decode(errors="ignore").lower()
+                            == "utt.exe"
+                        ):
+                            handle = kernel32.OpenProcess(
+                                PROCESS_TERMINATE, False, entry.th32ProcessID
+                            )
+                            if handle:
+                                if kernel32.TerminateProcess(handle, 0):
+                                    killed.append(entry.th32ProcessID)
+                                kernel32.CloseHandle(handle)
+                        if not kernel32.Process32Next(
+                            snapshot, ctypes.byref(entry)
+                        ):
+                            break
+            finally:
+                kernel32.CloseHandle(snapshot)
+        except Exception:
+            pass
+        return killed
+
     def _apply_update(self, installer_path):
         if not getattr(sys, "frozen", False):
             QMessageBox.information(
@@ -3709,6 +3777,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
+            self._terminate_other_utts()
             subprocess.Popen(
                 [str(installer_path), "/VERYSILENT", "/SUPPRESSMSGBOXES"],
                 env=self._fresh_instance_env(),
@@ -3731,6 +3800,7 @@ class MainWindow(QMainWindow):
                     str(Path(__file__).resolve().parent / "main.py"),
                 ]
             command.extend(sys.argv[1:])
+            self._terminate_other_utts()
             subprocess.Popen(
                 command,
                 cwd=str(Path(__file__).resolve().parent),
