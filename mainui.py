@@ -42,7 +42,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -821,125 +821,163 @@ class PlatformPicker(QDialog):
         self.accept()
 
 
-def platform_file() -> Path:
-    return working_dir() / "platform.txt"
+CONFIG_FILE_NAME = "utt_config.json"
+
+
+def config_file() -> Path:
+    return working_dir() / CONFIG_FILE_NAME
+
+
+_config_cache: dict | None = None
+
+_LEGACY_SETTING_FILES = (
+    "platform.txt", "export_mode.txt", "theme.txt",
+    "skip_update_version.txt", "skip_archive.txt", "skip_4k_warning.txt",
+)
+
+
+def _read_text_file(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip().lower()
+    except OSError:
+        return ""
+
+
+def _load_config() -> dict:
+    """Load the JSON settings file, migrating the old .txt files once."""
+    global _config_cache
+    if _config_cache is not None:
+        return _config_cache
+    data = {}
+    try:
+        parsed = json.loads(config_file().read_text(encoding="utf-8"))
+        if isinstance(parsed, dict):
+            data = parsed
+    except (OSError, ValueError):
+        data = {}
+    if not data:
+        data = _migrate_legacy_config()
+    _config_cache = data
+    return data
+
+
+def _migrate_legacy_config() -> dict:
+    data = {}
+    folder = working_dir()
+    platform = _read_text_file(folder / "platform.txt")
+    if platform in PLATFORMS:
+        data["platform"] = platform
+    export_mode = _read_text_file(folder / "export_mode.txt")
+    if export_mode in ("bones", "mesh"):
+        data["export_mode"] = export_mode
+    theme = _read_text_file(folder / "theme.txt")
+    if theme in THEMES:
+        data["theme"] = theme
+    skip_update = _read_text_file(folder / "skip_update_version.txt")
+    if skip_update:
+        data["skip_update_version"] = skip_update
+    if (folder / "skip_archive.txt").is_file():
+        data["skip_archive"] = True
+    if (folder / "skip_4k_warning.txt").is_file():
+        data["skip_4k_warning"] = True
+    if data:
+        _write_config(data)
+        for name in _LEGACY_SETTING_FILES:
+            try:
+                (folder / name).unlink()
+            except OSError:
+                pass
+    return data
+
+
+def _write_config(data: dict) -> None:
+    global _config_cache
+    try:
+        config_file().write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+    _config_cache = data
 
 
 def get_saved_platform() -> str:
-    try:
-        value = platform_file().read_text(encoding="utf-8").strip().lower()
-    except OSError:
-        return ""
+    value = _load_config().get("platform", "")
     return value if value in PLATFORMS else ""
 
 
 def save_platform(platform: str) -> None:
     if platform not in PLATFORMS:
         return
-    try:
-        platform_file().write_text(platform, encoding="utf-8")
-    except OSError:
-        pass
-
-
-def export_mode_file() -> Path:
-    return working_dir() / "export_mode.txt"
+    data = dict(_load_config())
+    data["platform"] = platform
+    _write_config(data)
 
 
 def get_saved_export_mode() -> str:
     """Return "bones", "mesh", or "" when no default is saved."""
-    try:
-        value = export_mode_file().read_text(encoding="utf-8").strip().lower()
-    except OSError:
-        return ""
+    value = _load_config().get("export_mode", "")
     return value if value in ("bones", "mesh") else ""
 
 
 def save_export_mode(mode: str) -> None:
+    data = dict(_load_config())
     if mode not in ("bones", "mesh"):
-        try:
-            export_mode_file().unlink()
-        except OSError:
-            pass
-        return
-    try:
-        export_mode_file().write_text(mode, encoding="utf-8")
-    except OSError:
-        pass
-
-
-def theme_file() -> Path:
-    return working_dir() / "theme.txt"
-
-
-_saved_theme_cache: str | None = None
+        data.pop("export_mode", None)
+    else:
+        data["export_mode"] = mode
+    _write_config(data)
 
 
 def get_saved_theme() -> str:
-    global _saved_theme_cache
-    if _saved_theme_cache is None:
-        try:
-            value = theme_file().read_text(encoding="utf-8").strip().lower()
-        except OSError:
-            value = ""
-        _saved_theme_cache = value if value in THEMES else DEFAULT_THEME
-    return _saved_theme_cache
+    value = _load_config().get("theme", "")
+    return value if value in THEMES else DEFAULT_THEME
 
 
 def save_theme(name: str) -> None:
-    global _saved_theme_cache
     if name not in THEMES:
         return
-    try:
-        theme_file().write_text(name, encoding="utf-8")
-    except OSError:
-        pass
-    _saved_theme_cache = name
+    data = dict(_load_config())
+    data["theme"] = name
+    _write_config(data)
 
 
 def get_theme(name: str | None = None) -> dict:
     return THEMES[name or get_saved_theme()]
 
 
-def skip_update_version_file() -> Path:
-    return working_dir() / "skip_update_version.txt"
-
-
 def get_skipped_update_version() -> str:
     """Return the version the user asked to never be prompted about."""
-    try:
-        return skip_update_version_file().read_text(encoding="utf-8").strip()
-    except OSError:
-        return ""
+    return _load_config().get("skip_update_version", "")
 
 
 def save_skipped_update_version(version: str) -> None:
+    data = dict(_load_config())
     if not version:
-        try:
-            skip_update_version_file().unlink()
-        except OSError:
-            pass
-        return
-    try:
-        skip_update_version_file().write_text(version, encoding="utf-8")
-    except OSError:
-        pass
-
-
-def skip_archive_file() -> Path:
-    return working_dir() / "skip_archive.txt"
+        data.pop("skip_update_version", None)
+    else:
+        data["skip_update_version"] = version
+    _write_config(data)
 
 
 def get_skipped_archive() -> bool:
     """True once the user has skipped the createacharacter.big picker."""
-    return skip_archive_file().is_file()
+    return bool(_load_config().get("skip_archive"))
 
 
 def save_skipped_archive() -> None:
-    try:
-        skip_archive_file().write_text("1", encoding="utf-8")
-    except OSError:
-        pass
+    data = dict(_load_config())
+    data["skip_archive"] = True
+    _write_config(data)
+
+
+def get_skipped_4k_warning() -> bool:
+    """True once the user asked to never see the 4K recomp warning again."""
+    return bool(_load_config().get("skip_4k_warning"))
+
+
+def save_skipped_4k_warning() -> None:
+    data = dict(_load_config())
+    data["skip_4k_warning"] = True
+    _write_config(data)
 
 
 def choose_platform(parent=None) -> str:
@@ -3240,6 +3278,23 @@ class MainWindow(QMainWindow):
             )
             return
         folder = self.convert_output_input.text().strip() or str(self.output_dir)
+        big = [card for card in jobs if card.resolution_value > 2048]
+        if big and self.platform == "xbx" and not get_skipped_4k_warning():
+            names = ", ".join(Path(card.path).name for card in big[:3])
+            if len(big) > 3:
+                names += ", …"
+            box = QMessageBox(
+                QMessageBox.Icon.Warning, APP_TITLE,
+                "4K RX2 exports use the extended header and will NOT load "
+                "on a real Xbox 360 - they are for the PC recomp only.\n\n"
+                f"{names}",
+                QMessageBox.StandardButton.Ok, self,
+            )
+            never_again = QCheckBox("Don't show this warning again", box)
+            box.setCheckBox(never_again)
+            box.exec()
+            if never_again.isChecked():
+                save_skipped_4k_warning()
         self.convert_button.setEnabled(False)
 
         def task():

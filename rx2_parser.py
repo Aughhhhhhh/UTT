@@ -253,9 +253,17 @@ class RX2File(object):
             return None
         hdr = data[hdr_off:hdr_off + 40]
         fmt = hdr[35]
-        width = ((hdr[38] << 8) | hdr[39])
-        width = (width + 1) & 0x1FFF
-        height = (hdr[37] + 1) * 8
+        dims = int.from_bytes(hdr[36:40], "big")
+        if hdr[36]:
+            # Extended layout (PC recomp exports): height:13 = h-1 at bits
+            # 13-25, width:13 = w-1 at bits 0-12.
+            width = (dims & 0x1FFF) + 1
+            height = ((dims >> 13) & 0x1FFF) + 1
+        else:
+            # Stock Xbox 360 layout: height = (byte 37 + 1) * 8, width 13 bits.
+            width = ((hdr[38] << 8) | hdr[39])
+            width = (width + 1) & 0x1FFF
+            height = (hdr[37] + 1) * 8
         dxt5_variant = hdr[28]
         if width <= 0 or height <= 0:
             self.warnings.append("texture entry %d: bad dimensions %dx%d"
@@ -840,6 +848,308 @@ def _decode_raw_a8(data, width, height):
         out[o + 1] = v
         out[o + 2] = v
         out[o + 3] = v
+    return bytes(out)
+
+
+def _encode_dxt5_block(px):
+    """Encode 16 RGBA pixels into one 16-byte X360 DXT5 block.
+
+    The Xbox 360 stores DXT blocks with the alpha part first and every
+    16-bit word byte-swapped; ``_dxt5_block`` / ``_dxt1_block`` decode the
+    same layout, so encode -> decode round-trips exactly.
+
+    ``px`` is a list of 16 ``(r, g, b, a)`` tuples in row-major order.
+    """
+    alphas = [p[3] for p in px]
+    a_min = min(alphas)
+    a_max = max(alphas)
+    if a_max > a_min:
+        a0 = a_max
+        a1 = a_min
+        table = [a0, a1] + [((6 - i) * a0 + (i + 1) * a1) // 7 for i in range(6)]
+        bits = 0
+        for p in range(16):
+            value = alphas[p]
+            best = 0
+            best_d = abs(table[0] - value)
+            for i in range(1, 8):
+                d = abs(table[i] - value)
+                if d < best_d:
+                    best_d = d
+                    best = i
+            bits |= best << (3 * p)
+        aidx = _swap16(bits.to_bytes(6, "little"))
+    else:
+        a0 = a1 = alphas[0]
+        aidx = b"\x00" * 6
+
+    lo = (min(p[0] for p in px), min(p[1] for p in px), min(p[2] for p in px))
+    hi = (max(p[0] for p in px), max(p[1] for p in px), max(p[2] for p in px))
+    c0 = _rgb565_pack(*hi)
+    c1 = _rgb565_pack(*lo)
+    r0, g0, b0 = _rgb565(c0)
+    r1, g1, b1 = _rgb565(c1)
+    c2, c3 = _rgb565_interp((c0 >> 11) & 0x1F, (c1 >> 11) & 0x1F,
+                            (c0 >> 5) & 0x3F, (c1 >> 5) & 0x3F,
+                            c0 & 0x1F, c1 & 0x1F)
+    palette = [(r0, g0, b0), (r1, g1, b1), c2, c3]
+
+    blk = bytearray(16)
+    blk[0] = a1
+    blk[1] = a0
+    blk[2:8] = aidx
+    blk[8:10] = struct.pack(">H", c0)
+    blk[10:12] = struct.pack(">H", c1)
+    for y in range(4):
+        byte = 0
+        for x in range(4):
+            r, g, b = px[y * 4 + x][:3]
+            best = 0
+            best_d = (palette[0][0] - r) ** 2 + (palette[0][1] - g) ** 2 + (palette[0][2] - b) ** 2
+            for i in range(1, 4):
+                pr, pg, pb = palette[i]
+                d = (pr - r) ** 2 + (pg - g) ** 2 + (pb - b) ** 2
+                if d < best_d:
+                    best_d = d
+                    best = i
+            byte |= best << (x * 2)
+        blk[12 + (y ^ 1)] = byte
+    return bytes(blk)
+
+
+def _tile360(src, width_units, texel_pitch):
+    """Apply the X360 GPU tiled-memory layout (inverse of ``_untile360``)."""
+    dst = bytearray(len(src))
+    units = len(src) // texel_pitch
+    for j in range(units // width_units):
+        for i in range(width_units):
+            x = _x360_tiled_x(j * width_units + i, width_units, texel_pitch)
+            y = _x360_tiled_y(j * width_units + i, width_units, texel_pitch)
+            src_idx = (y * width_units + x) * texel_pitch
+            dst_idx = (j * width_units + i) * texel_pitch
+            if src_idx + texel_pitch <= len(src) and dst_idx + texel_pitch <= len(dst):
+                dst[dst_idx:dst_idx + texel_pitch] = src[src_idx:src_idx + texel_pitch]
+    return bytes(dst)
+
+
+def _encode_dxt5_np(rgba, width, height):
+    """numpy-accelerated ``encode_dxt5`` (vectorised block encoder)."""
+    import numpy as np
+
+    arr = np.frombuffer(rgba, dtype=np.uint8).reshape(height, width, 4)
+    bh = (height + 3) >> 2
+    bw = (width + 3) >> 2
+    if height % 4 or width % 4:
+        pad = np.zeros((bh * 4, bw * 4, 4), dtype=np.uint8)
+        pad[:height, :width] = arr
+        arr = pad
+    blk = arr.reshape(bh, 4, bw, 4, 4).transpose(0, 2, 1, 3, 4)
+    blk = blk.reshape(bh * bw, 16, 4)
+
+    alpha = blk[:, :, 3].astype(np.int16)
+    a_max = alpha.max(axis=1)
+    a_min = alpha.min(axis=1)
+    same = a_max == a_min
+    a0 = np.where(same, alpha[:, 0], a_max)
+    a1 = np.where(same, alpha[:, 0], a_min)
+    idx6 = np.arange(6, dtype=np.int16)
+    t2 = ((6 - idx6) * a_max[:, None] + (idx6 + 1) * a_min[:, None]) // 7
+    table = np.concatenate([a_max[:, None], a_min[:, None], t2], axis=1)
+    best = np.argmin(np.abs(table[:, None, :] - alpha[:, :, None]), axis=2)
+    bits = (best.astype(np.int64) << np.arange(16, dtype=np.int64)[None, :] * 3).sum(axis=1)
+    aidx_le = ((bits[:, None] >> (8 * np.arange(6, dtype=np.int64))[None, :]) & 0xFF).astype(np.uint8)
+    aidx = aidx_le[:, [1, 0, 3, 2, 5, 4]]
+
+    rgb = blk[:, :, :3].astype(np.int32)
+    hi = rgb.max(axis=1)
+    lo = rgb.min(axis=1)
+    c0 = ((hi[:, 0] >> 3) << 11) | ((hi[:, 1] >> 2) << 5) | (hi[:, 2] >> 3)
+    c1 = ((lo[:, 0] >> 3) << 11) | ((lo[:, 1] >> 2) << 5) | (lo[:, 2] >> 3)
+    r0 = ((c0 >> 11) & 0x1F) * 255 // 31
+    g0 = ((c0 >> 5) & 0x3F) * 255 // 63
+    b0 = (c0 & 0x1F) * 255 // 31
+    r1 = ((c1 >> 11) & 0x1F) * 255 // 31
+    g1 = ((c1 >> 5) & 0x3F) * 255 // 63
+    b1 = (c1 & 0x1F) * 255 // 31
+    pal0 = np.stack([r0, g0, b0], axis=1)
+    pal1 = np.stack([r1, g1, b1], axis=1)
+    pal2 = (2 * pal0 + pal1 + 1) // 3
+    pal3 = (pal0 + 2 * pal1 + 1) // 3
+    palette = np.stack([pal0, pal1, pal2, pal3], axis=1)
+    dist = ((palette[:, None, :, :] - rgb[:, :, None, :]) ** 2).sum(axis=-1)
+    cidx = np.argmin(dist, axis=2).reshape(-1, 4, 4)
+    row_bits = (cidx << np.array([0, 2, 4, 6], dtype=np.uint8)[None, None, :]).sum(axis=2)
+    row_bytes = row_bits[:, [1, 0, 3, 2]].astype(np.uint8)
+
+    out = np.zeros((bh * bw, 16), dtype=np.uint8)
+    out[:, 0] = a1.astype(np.uint8)
+    out[:, 1] = a0.astype(np.uint8)
+    out[:, 2:8] = aidx
+    out[:, 8] = ((c0 >> 8) & 0xFF).astype(np.uint8)
+    out[:, 9] = (c0 & 0xFF).astype(np.uint8)
+    out[:, 10] = ((c1 >> 8) & 0xFF).astype(np.uint8)
+    out[:, 11] = (c1 & 0xFF).astype(np.uint8)
+    out[:, 12:16] = row_bytes
+
+    units = bh * bw
+    k = np.arange(units, dtype=np.int64)
+    pitch = 16
+    log_bpp = (pitch >> 2) + ((pitch >> 1) >> (pitch >> 2))
+    aligned_width = (bw + 31) & ~31
+    off_b = k << log_bpp
+    off_t = ((off_b & ~4095) >> 3) + ((off_b & 1792) >> 2) + (off_b & 63)
+    off_m = off_t >> (7 + log_bpp)
+    macro_x = (off_m % (aligned_width >> 5)) << 2
+    tile_x = (((off_t >> (5 + log_bpp)) & 2) + (off_b >> 6)) & 3
+    micro_x = ((((off_t >> 1) & ~15) + (off_t & 15)) & ((pitch << 3) - 1)) >> log_bpp
+    xs = ((macro_x + tile_x) << 3) + micro_x
+    macro_y = (off_m // (aligned_width >> 5)) << 2
+    tile_y = ((off_t >> (6 + log_bpp)) & 1) + ((off_b & 2048) >> 10)
+    micro_y = ((((off_t & (((pitch << 6) - 1) & ~31)) + ((off_t & 15) << 1)) >> (3 + log_bpp)) & ~1)
+    ys = ((macro_y + tile_y) << 3) + micro_y + ((off_t & 16) >> 4)
+    perm = ys * bw + xs
+    valid = perm < units
+    tiled = np.zeros((units, 16), dtype=np.uint8)
+    tiled[valid] = out[perm[valid]]
+    return tiled.tobytes()
+
+
+def encode_dxt5(rgba, width, height):
+    """Encode an RGBA8888 byte buffer to a tiled DXT5 mip (X360 layout).
+
+    ``rgba`` must be exactly ``width * height * 4`` bytes, row-major.
+    Returns the tiled DXT5 byte buffer, ``bw * bh * 16`` bytes where
+    ``bw = (width + 3) >> 2`` etc.
+    """
+    try:
+        return _encode_dxt5_np(rgba, width, height)
+    except ImportError:
+        pass
+
+    bw = (width + 3) >> 2
+    bh = (height + 3) >> 2
+    linear = bytearray(bw * bh * 16)
+    for by in range(bh):
+        for bx in range(bw):
+            px = []
+            for yy in range(4):
+                y = by * 4 + yy
+                row = y * width * 4 if y < height else -1
+                for xx in range(4):
+                    x = bx * 4 + xx
+                    if row >= 0 and x < width:
+                        o = row + x * 4
+                        px.append((rgba[o], rgba[o + 1], rgba[o + 2], rgba[o + 3]))
+                    else:
+                        px.append((0, 0, 0, 0))
+            blk = _encode_dxt5_block(px)
+            off = (by * bw + bx) * 16
+            linear[off:off + 16] = blk
+    return _tile360(bytes(linear), bw, 16)
+
+
+def _box_downsample(rgba, w, h, w2, h2):
+    """Average 2x2 pixel blocks into a smaller RGBA buffer."""
+    try:
+        import numpy as _np
+        arr = _np.frombuffer(rgba, dtype=_np.uint8).reshape(h, w, 4)
+        if h & 1:
+            arr = _np.concatenate([arr, arr[-1:]], axis=0)
+        if w & 1:
+            arr = _np.concatenate([arr, arr[:, -1:]], axis=1)
+        quad = (arr[0:h2 * 2:2, 0:w2 * 2:2].astype(_np.uint16)
+                + arr[0:h2 * 2:2, 1:w2 * 2 + 1:2]
+                + arr[1:h2 * 2 + 1:2, 0:w2 * 2:2]
+                + arr[1:h2 * 2 + 1:2, 1:w2 * 2 + 1:2])
+        return (quad >> 2).astype(_np.uint8).tobytes()
+    except ImportError:
+        pass
+
+    out = bytearray(w2 * h2 * 4)
+    for y in range(h2):
+        y0 = y * 2
+        y1 = min(y0 + 1, h - 1)
+        for x in range(w2):
+            x0 = x * 2
+            x1 = min(x0 + 1, w - 1)
+            total = [0, 0, 0, 0]
+            for yy in (y0, y1):
+                r1 = yy * w * 4
+                for xx in (x0, x1):
+                    o = r1 + xx * 4
+                    total[0] += rgba[o]
+                    total[1] += rgba[o + 1]
+                    total[2] += rgba[o + 2]
+                    total[3] += rgba[o + 3]
+            o = (y * w2 + x) * 4
+            for c in range(4):
+                out[o + c] = total[c] >> 2
+    return bytes(out)
+
+
+def encode_rx2_texture(template, width, height, rgba, min_mip=128):
+    """Build a complete RX2 file from an RGBA image (pure Python encoder).
+
+    ``template`` is the byte content of a known-good RX2 container; its
+    header and file table are reused verbatim and the payload is replaced
+    with a freshly encoded DXT5 mip chain. ``rgba`` is ``width * height * 4``
+    row-major RGBA bytes (apply any opacity to the alpha channel before
+    calling). Mips are generated down to ``min_mip`` (the X360 swizzle is
+    only exact at widths of 32 block units, i.e. 128px).
+
+    Returns the complete RX2 file as bytes.
+    """
+    rx2 = RX2File(template)
+    rx2.parse()
+    entry = next((e for e in rx2.entries if e.is_texture), None)
+    if entry is None:
+        raise RX2ParseError("the container template has no texture entry")
+    if entry.info_offset is None or entry.info_offset + 40 > rx2.data_base:
+        raise RX2ParseError("the container template stores its texture info "
+                            "outside the header region")
+    if len(rgba) < width * height * 4:
+        raise RX2ParseError("RGBA buffer is too small for %dx%d" % (width, height))
+    if (width & (width - 1)) or (height & (height - 1)):
+        raise RX2ParseError("only square power-of-two textures are supported")
+    if width != height:
+        raise RX2ParseError("only square textures are supported")
+    if not 16 <= width <= 4096:
+        raise RX2ParseError("unsupported texture size %dx%d" % (width, height))
+    if height > 4096:
+        raise RX2ParseError("unsupported texture size %dx%d" % (width, height))
+
+    mips = []
+    w, h = width, height
+    cur = rgba
+    while True:
+        mips.append((w, h, cur))
+        if max(w, h) <= min_mip:
+            break
+        w2, h2 = max(1, w >> 1), max(1, h >> 1)
+        cur = _box_downsample(cur, w, h, w2, h2)
+        w, h = w2, h2
+
+    chain = b"".join(encode_dxt5(m, w, h) for (w, h, m) in mips)
+
+    out = bytearray(template[:rx2.data_base])
+    out += chain
+    p = entry.info_offset
+    out[p + 28:p + 32] = struct.pack(">I", 64 * (len(mips) - 1))
+    out[p + 32:p + 36] = struct.pack(">I", 0xA00 + max(0x4000, width * width))
+    out[p + 35] = FMT_DXT5
+    # Real game files store the dimensions as width:13 = w-1 in bytes 38-39
+    # and height in bytes 36-37 as (h-1)>>3 (8 bits, so max 2048 tall);
+    # the Noesis plugin reads exactly that. Exports taller than 2048 (PC
+    # recomp) use the extended layout instead: full 13-bit height at bits
+    # 13-25, which stock Xbox tooling misreads but recomp handles.
+    if height <= 2048:
+        out[p + 36:p + 40] = struct.pack(
+            ">I", (((height - 1) >> 3) << 16) | (width - 1))
+    else:
+        out[p + 36:p + 40] = struct.pack(
+            ">I", ((height - 1) << 13) | (width - 1))
+    f2_pos = rx2.file_table_offset + (entry.index - 1) * 24 + 8
+    out[f2_pos:f2_pos + 4] = struct.pack(">I", len(chain))
     return bytes(out)
 
 
