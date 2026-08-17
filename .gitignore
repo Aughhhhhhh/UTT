@@ -12,6 +12,7 @@ exports/
 *.log
 build_log*.txt
 plan.txt
+context.txt
 utt_crash.log
 UTT Plans, recreation of CFSS.txt
 
