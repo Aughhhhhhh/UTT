@@ -802,9 +802,11 @@ def _decode_interleaved(
     )
     values = array.astype(np.float32, copy=True)
     if attribute.data_type == "int16":
-        if attribute.semantic == "position" and platform == "ps3":
-            # PS3 stores S16 positions in bone units (1/16384 of a unit);
-            # the Blender reference importer dequantizes with 16384.
+        if attribute.semantic == "position":
+            # Both platforms store S16 positions in bone units (1/16384 of
+            # a unit).  Dequantizing with 16384 keeps the mesh in the same
+            # space as the bone matrices, so skinned exports line up (the
+            # Blender reference importer's S16_SCALE handling).
             values /= np.float32(16384.0)
         else:
             # Noesis normalizes integer vertex attributes (SHORT -> /32768,

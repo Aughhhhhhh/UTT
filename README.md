@@ -37,7 +37,7 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
 
 ## Install
 
-Download `UTT-Setup-2.0.2.exe` from the
+Download `UTT-Setup-2.1.0.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -96,12 +96,29 @@ Collaborators with write access can publish installers without the GitHub CLI:
    separate Git installation.
 3. Run `build_installer.bat`.
 4. Open the repository's **Releases** page and choose **Draft a new release**.
-5. Create a tag matching the version, such as `v2.0.2`, and attach
-   `build/installer/UTT-Setup-2.0.2.exe`.
+5. Create a tag matching the version, such as `v2.1.0`, and attach
+   `build/installer/UTT-Setup-2.1.0.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release
 asset when correcting the build for that exact version.
+
+## What's new in 2.1.0
+
+- Xbox 360 and PS3 now work straight from your game folder: UTT locates
+  `createacharacter.big` (or a loose copy), backs up the untouched original
+  by size, and unpacks it. "Keep files packed" edits in a local cache and
+  repacks back into the game folder; "Keep files unpacked" reads and writes
+  the loose `createacharacter` + `recipe` folders directly.
+- PS3 selects your RPCS3 folder and finds Skate 3 under `games/Skate_3_BLUS`
+  or `games/Skate_3_BLES` (both serials are detected, with a manual fallback).
+  The `dev_hdd0/game/<serial>_INSTALL` folders are cleaned silently on launch
+  so installed data never shadows the loose files.
+- First-run setup can be skipped entirely; Choose archive re-asks any skipped
+  steps. Repacking offers an "always unpack" prompt with a Settings toggle.
+- Fixed skinned GLB export on Xbox: vertex positions now share the same
+  bone-unit space as the skeleton, so the mesh no longer exports smaller
+  than the armature.
 
 ## What's new in 2.0.2
 

@@ -39,6 +39,8 @@ python -m PyInstaller --noconfirm --clean --onefile --noupx --windowed --name UT
   --add-data "%CD%\UTT.ico;." ^
   --add-data "%CD%\xbx.png;." ^
   --add-data "%CD%\ps3.png;." ^
+  --add-data "%CD%\Keep Files Packed.png;." ^
+  --add-data "%CD%\Keep Files Unpacked.png;." ^
   main.py
 
 if errorlevel 1 exit /b %errorlevel%
@@ -61,6 +63,10 @@ if errorlevel 1 exit /b %errorlevel%
 copy /Y "%CD%\xbx.png" "%CD%\build\xbx.png" >nul
 if errorlevel 1 exit /b %errorlevel%
 copy /Y "%CD%\ps3.png" "%CD%\build\ps3.png" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /Y "%CD%\Keep Files Packed.png" "%CD%\build\Keep Files Packed.png" >nul
+if errorlevel 1 exit /b %errorlevel%
+copy /Y "%CD%\Keep Files Unpacked.png" "%CD%\build\Keep Files Unpacked.png" >nul
 if errorlevel 1 exit /b %errorlevel%
 
 if defined UTT_SIGN_CERT_SHA1 (

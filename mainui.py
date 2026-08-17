@@ -35,6 +35,15 @@ import updater
 from alpha_mask import apply_alpha_mask
 from archive_manager import ArchiveManager
 from gltf_exporter import export_gltf
+from game_route import (
+    clean_ps3_install_folders,
+    content_dir,
+    game_root,
+    is_original_big,
+    locate_or_backup_source,
+    ps3_game_dir,
+    unpack_into_game,
+)
 from mdl_parser import extract_material_textures
 from model_viewer import ModelPreview
 from psg_converter import PSGConverter
@@ -42,7 +51,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -761,6 +770,59 @@ class PlatformCard(QWidget):
         super().mousePressEvent(event)
 
 
+class PackModeCard(QWidget):
+    """Clickable pack-mode card: 256x256 image blurs and shows a text overlay on hover."""
+
+    clicked = pyqtSignal()
+
+    def __init__(self, image_path: str, text: str, parent=None):
+        super().__init__(parent)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setObjectName("packModeCard")
+        self.setFixedSize(256, 256)
+
+        layout = QGridLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        pixmap = QPixmap(image_path)
+        if pixmap.isNull():
+            pixmap = QPixmap(256, 256)
+            pixmap.fill(Qt.GlobalColor.darkGray)
+        self.image_label.setPixmap(pixmap.scaled(
+            256,
+            256,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        ))
+        layout.addWidget(self.image_label, 0, 0)
+
+        self.text_label = QLabel(text)
+        self.text_label.setObjectName("packModeText")
+        self.text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.text_label.setWordWrap(True)
+        self.text_label.setVisible(False)
+        layout.addWidget(self.text_label, 0, 0, Qt.AlignmentFlag.AlignCenter)
+
+    def enterEvent(self, event):
+        effect = QGraphicsBlurEffect(self.image_label)
+        effect.setBlurRadius(14)
+        self.image_label.setGraphicsEffect(effect)
+        self.text_label.setVisible(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self.image_label.setGraphicsEffect(None)
+        self.text_label.setVisible(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class PlatformPicker(QDialog):
     """First-run gate: choose the console (Xbox 360 / PS3) before anything else."""
 
@@ -819,6 +881,160 @@ class PlatformPicker(QDialog):
     def _choose(self, platform: str):
         self.selected = platform
         self.accept()
+
+
+class PackModePicker(QDialog):
+    """First-run gate: choose 'Keep files packed' or 'Keep files unpacked'."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected: bool | None = None  # True = packed, False = unpacked
+        self.setWindowTitle(f"{APP_TITLE} — How to keep your game files")
+        self.setModal(True)
+        self.setMinimumSize(700, 520)
+        self.setStyleSheet("""
+            QWidget { background: #202124; color: #f1f3f4; font-size: 14px; }
+            QLabel#packModeTitle { font-size: 26px; font-weight: 700; }
+            QLabel#packModeSubtitle { color: #aeb4bd; }
+            QLabel#packModeText {
+                background: rgba(20, 20, 24, 210); color: #ffffff;
+                font-size: 15px; font-weight: 700; padding: 12px 16px;
+                border-radius: 10px;
+            }
+            QWidget#packModeCard {
+                background: #2b2c2f; border: 1px solid #3c4043;
+                border-radius: 16px;
+            }
+            QWidget#packModeCard:hover { border: 1px solid #8ab4f8; }
+        """)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(16)
+
+        title = QLabel("How do you want to keep your game files?")
+        title.setObjectName("packModeTitle")
+        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Keep files packed to have the game read a .big archive, or keep "
+            "files unpacked to read loose files directly and replace textures "
+            "and models more easily. You can change this later in Settings."
+        )
+        subtitle.setObjectName("packModeSubtitle")
+        subtitle.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        row = QHBoxLayout()
+        row.setSpacing(24)
+        self.packed_card = PackModeCard(
+            str(resource_file("Keep Files Packed.png")),
+            "Keep files packed, recommended for newer users and Xbox users",
+            self,
+        )
+        self.unpacked_card = PackModeCard(
+            str(resource_file("Keep Files Unpacked.png")),
+            "Keep files unpacked, recommended for Recomp, easier texture and model replacing",
+            self,
+        )
+        self.packed_card.clicked.connect(lambda: self._choose(True))
+        self.unpacked_card.clicked.connect(lambda: self._choose(False))
+        row.addWidget(self.packed_card)
+        row.addWidget(self.unpacked_card)
+        layout.addLayout(row, 1)
+
+    def _choose(self, packed: bool):
+        self.selected = packed
+        self.accept()
+
+
+def _dialog_theme_style(platform: str) -> str:
+    """Themed stylesheet for standalone setup dialogs.
+
+    Dialogs shown before the main window exists (or re-shown from Choose
+    archive) need their own theme so they match the app instead of falling
+    back to the default Fusion look.
+    """
+    theme = THEMES[get_saved_theme()]
+    accent = theme[platform]
+    return (
+        "QDialog { background: #202124; color: #f1f3f4; font-size: 14px; }"
+        "QLabel#dialogTitle { font-size: 20px; font-weight: 700; }"
+        "QPushButton { background: " + accent["accent"] + "; border: 0; "
+        "border-radius: 16px; padding: 9px 16px; font-weight: 600; }"
+        "QPushButton:hover { background: " + accent["hover"] + "; }"
+        "QPushButton:disabled { background: #45474b; color: #9aa0a6; }"
+        "QPushButton#skipButton { background: transparent; color: #aeb4bd; "
+        "border: 1px solid " + theme["border"] + "; }"
+        "QPushButton#skipButton:hover { background: " + theme["line"] + "; "
+        "color: #ffffff; }"
+    )
+
+
+class GameFolderPicker(QDialog):
+    """First-run gate: pick the game folder UTT will work from."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.selected_path = ""
+        self.setWindowTitle("Select your game location")
+        self.setModal(True)
+        self.setMinimumWidth(560)
+        platform = get_saved_platform() or "xbx"
+        self.setStyleSheet(_dialog_theme_style(platform))
+
+        layout = QVBoxLayout(self)
+        title = QLabel("Select your game location")
+        title.setObjectName("dialogTitle")
+        layout.addWidget(title)
+        hint = (
+            "Pick your RPCS3 folder — UTT finds the game in "
+            "games/Skate_3_BLUS or games/Skate_3_BLES, then reads "
+            "PS3_GAME/USRDIR/data/content."
+            if platform == "ps3"
+            else "Pick the folder that contains the game's data folder — "
+            "UTT looks for the archive in data/content."
+        )
+        layout.addWidget(QLabel(
+            "UTT needs to know where your game files are so it can find "
+            "createacharacter.big and unpack your files into the right place. "
+            + hint
+        ))
+        row = QHBoxLayout()
+        self.path_label = QLabel("No game folder selected")
+        self.path_label.setWordWrap(True)
+        self.pick_button = QPushButton("Browse…")
+        self.pick_button.clicked.connect(self.pick_folder)
+        row.addWidget(self.path_label, 1)
+        row.addWidget(self.pick_button)
+        layout.addLayout(row)
+        self.continue_button = QPushButton("Continue")
+        self.continue_button.setEnabled(False)
+        self.continue_button.clicked.connect(self.accept)
+        buttons = QHBoxLayout()
+        skip_all = QPushButton("Skip all")
+        skip_all.setObjectName("skipButton")
+        skip_all.clicked.connect(self.reject)
+        buttons.addWidget(skip_all)
+        buttons.addStretch(1)
+        buttons.addWidget(self.continue_button)
+        layout.addLayout(buttons)
+        layout.addWidget(QLabel(
+            "Skip all opens UTT without a game folder — you can still browse "
+            "the catalog, convert, and use the quick viewer. You can set up "
+            "the game folder later from the Choose archive button."
+        ))
+
+    def pick_folder(self):
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select your game location", ""
+        )
+        if not folder:
+            return
+        self.selected_path = folder
+        self.path_label.setText(folder)
+        self.continue_button.setEnabled(True)
 
 
 CONFIG_FILE_NAME = "utt_config.json"
@@ -912,6 +1128,110 @@ def save_platform(platform: str) -> None:
     _write_config(data)
 
 
+def get_keep_files_packed() -> bool | None:
+    """Return True (keep packed), False (keep unpacked), or None when unset."""
+    value = _load_config().get("keep_files_packed")
+    if value is None:
+        return None
+    return bool(value)
+
+
+def save_keep_files_packed(packed: bool) -> None:
+    data = dict(_load_config())
+    data["keep_files_packed"] = bool(packed)
+    _write_config(data)
+
+
+def get_game_folder(platform: str | None = None) -> str:
+    """Return the saved game folder path for *platform* ('' when unset)."""
+    platform = platform or get_saved_platform()
+    data = _load_config()
+    folders = data.get("game_folders")
+    if isinstance(folders, dict):
+        value = folders.get(platform, "")
+        if isinstance(value, str):
+            return value
+    # Legacy single-platform value saved before per-platform folders.
+    legacy = data.get("game_folder")
+    if platform == "xbx" and isinstance(legacy, str):
+        return legacy
+    return ""
+
+
+def save_game_folder(folder: str, platform: str | None = None) -> None:
+    platform = platform or get_saved_platform()
+    data = dict(_load_config())
+    folders = data.get("game_folders")
+    if not isinstance(folders, dict):
+        folders = {}
+    if folder:
+        folders[platform] = str(Path(folder))
+    else:
+        folders.pop(platform, None)
+    data["game_folders"] = folders
+    data.pop("game_folder", None)  # drop the legacy single-platform value
+    _write_config(data)
+
+
+def get_rpcs3_folder(platform: str | None = None) -> str:
+    """Return the saved RPCS3 root folder for *platform* ('' when unset).
+
+    Kept separate from the game folder because when RPCS3 detection fails UTT
+    saves a manually-chosen game folder instead, but the install-folder
+    cleanup still needs the RPCS3 root to find dev_hdd0.
+    """
+    platform = platform or get_saved_platform()
+    data = _load_config()
+    folders = data.get("rpcs3_folders")
+    if isinstance(folders, dict):
+        value = folders.get(platform, "")
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def save_rpcs3_folder(folder: str, platform: str | None = None) -> None:
+    platform = platform or get_saved_platform()
+    data = dict(_load_config())
+    folders = data.get("rpcs3_folders")
+    if not isinstance(folders, dict):
+        folders = {}
+    if folder:
+        folders[platform] = str(Path(folder))
+    else:
+        folders.pop(platform, None)
+    data["rpcs3_folders"] = folders
+    _write_config(data)
+
+
+def get_skipped_setup() -> bool:
+    """True when the user skipped all first-run setup (Skip all)."""
+    return bool(_load_config().get("skipped_setup"))
+
+
+def save_skipped_setup(skipped: bool) -> None:
+    data = dict(_load_config())
+    if skipped:
+        data["skipped_setup"] = True
+    else:
+        data.pop("skipped_setup", None)
+    _write_config(data)
+
+
+def get_always_unpack() -> bool:
+    """True when the startup unpack prompt should be skipped (always unpack)."""
+    return bool(_load_config().get("always_unpack"))
+
+
+def save_always_unpack(value: bool) -> None:
+    data = dict(_load_config())
+    if value:
+        data["always_unpack"] = True
+    else:
+        data.pop("always_unpack", None)
+    _write_config(data)
+
+
 def get_saved_export_mode() -> str:
     """Return "bones", "mesh", or "" when no default is saved."""
     value = _load_config().get("export_mode", "")
@@ -990,6 +1310,70 @@ def choose_platform(parent=None) -> str:
     if picker.selected:
         save_platform(picker.selected)
     return picker.selected
+
+
+def choose_pack_mode(parent=None) -> bool:
+    """Return True once the user has picked a pack mode (or one is already saved)."""
+    if get_keep_files_packed() is not None:
+        return True
+    picker = PackModePicker(parent)
+    picker.exec()
+    if picker.selected is not None:
+        save_keep_files_packed(picker.selected)
+        return True
+    return False
+
+
+def prompt_ps3_game_folder(parent=None) -> str:
+    """Ask for the Skate 3 game folder manually when RPCS3 detection fails.
+
+    Returns the chosen path, or '' when cancelled.
+    """
+    QMessageBox.information(
+        parent,
+        APP_TITLE,
+        "UTT couldn't find Skate 3 (Skate_3_BLUS or Skate_3_BLES) under "
+        "that RPCS3 folder.\n\nPlease select your game location manually — "
+        "the PS3_GAME folder (the one that contains USRDIR/data/content).",
+    )
+    return QFileDialog.getExistingDirectory(parent, "Select your game location", "")
+
+
+def resolve_ps3_game_selection(parent, folder: str) -> str:
+    """Return the folder to save after a PS3 RPCS3 selection.
+
+    When the RPCS3 root contains a standard Skate 3 title it is kept so the
+    game path can be derived from it; otherwise the user picks the game
+    folder (PS3_GAME) themselves and that path is saved instead.
+    """
+    if ps3_game_dir(folder) is None:
+        manual = prompt_ps3_game_folder(parent)
+        if manual:
+            return manual
+    return folder
+
+
+def choose_game_folder(parent=None, platform: str | None = None) -> bool:
+    """Return True when a game folder is chosen (or already saved).
+
+    Returns False when the user skips all setup — the app then opens without
+    a game folder or cache, and Choose archive can re-run this later.
+    """
+    platform = platform or get_saved_platform() or "xbx"
+    if get_game_folder(platform):
+        return True
+    picker = GameFolderPicker(parent)
+    picker.exec()
+    if picker.selected_path:
+        chosen = picker.selected_path
+        if platform == "ps3":
+            save_rpcs3_folder(chosen, platform)
+            chosen = resolve_ps3_game_selection(parent, chosen)
+        save_game_folder(chosen, platform)
+        save_skipped_setup(False)
+        return True
+    save_skipped_setup(True)
+    return False
 
 
 def rx2_preview_image(path: Path, opaque: bool = False, alpha_mask: bool = False):
@@ -1102,7 +1486,7 @@ class ArchivePicker(QDialog):
 
     Closing it (X or Escape) skips the cache and continues into the app.
     """
-    def __init__(self, parent=None, platform: str = "ps3"):
+    def __init__(self, parent=None, platform: str = "ps3", unpacked: bool = False):
         super().__init__(parent)
         self.selected_path: Path | None = None
         self.setWindowTitle("Select createacharacter.big")
@@ -1110,15 +1494,24 @@ class ArchivePicker(QDialog):
         self.setMinimumWidth(520)
 
         info = PLATFORMS[platform]
+        self.setStyleSheet(_dialog_theme_style(platform))
         layout = QVBoxLayout(self)
         title = QLabel("Select your createacharacter.big file")
         title.setObjectName("dialogTitle")
         layout.addWidget(title)
+        if unpacked:
+            dest_text = (
+                "The archive will be unpacked into your game folder "
+                "(data/content), where the game reads loose files."
+            )
+        else:
+            dest_text = (
+                "The archive will be extracted into a local cache folder beside "
+                f"UTT, as .{info['extension']} files under cache\\{platform}."
+            )
         layout.addWidget(QLabel(
             "UTT needs the game archive before it can list or preview textures. "
-            "The archive will be extracted into a local cache folder beside UTT.\n\n"
-            f"Platform: {info['name']} — extracted files will be stored as "
-            f".{info['extension']} files under cache\\{platform}.\n\n"
+            f"{dest_text}\n\n"
             "You can close this window to skip it — the app still works, "
             "you just won't have textures or models from the archive. "
             "Skipping is remembered, so this window won't appear again "
@@ -1535,7 +1928,19 @@ class MainWindow(QMainWindow):
         self.root_dir = resource_dir()
         self.user_dir = working_dir()
         self.assets_dir = self.root_dir / "assets"
-        self.cache_dir = self.user_dir / "cache" / self.platform
+        self.keep_unpacked = get_keep_files_packed() is False
+        self.game_folder = (
+            Path(get_game_folder(self.platform))
+            if get_game_folder(self.platform)
+            else None
+        )
+        self._clean_ps3_install_folders()
+        self.drawing_from_game = (
+            self.game_folder is not None
+            and self._has_loose_content(content_dir(self.game_folder, self.platform))
+        )
+        self.cache_dir = self._resolve_cache_dir()
+        self.content_root = self._resolve_content_root()
         self.output_dir = (
             self.user_dir / "exports" / ("xbx" if self.platform == "xbx" else "psg")
         )
@@ -1575,6 +1980,35 @@ class MainWindow(QMainWindow):
         self._restore_cache_or_request_archive()
         if getattr(sys, "frozen", False):
             QTimer.singleShot(1500, self._check_for_updates)
+
+    def _resolve_cache_dir(self) -> Path:
+        """Where UTT reads and writes game files.
+
+        Unpacked mode always draws from the game folder's content directory.
+        Packed mode draws from the game folder too whenever loose
+        createacharacter + recipe folders are already there; otherwise it uses
+        the local cache (cache/<platform>).
+        """
+        if self.game_folder:
+            content = content_dir(self.game_folder, self.platform)
+            if self.keep_unpacked or self._has_loose_content(content):
+                return content
+        return self.user_dir / "cache" / self.platform
+
+    def _resolve_content_root(self) -> Path:
+        """Where the createacharacter model folder lives for the current source."""
+        if self.keep_unpacked or self.drawing_from_game:
+            return self.cache_dir
+        return self.cache_dir / "data" / "content"
+
+    def _has_loose_content(self, content: Path) -> bool:
+        """True when the content dir has loose createacharacter (with model
+        files) and recipe folders the game reads."""
+        return (
+            content.is_dir()
+            and any(content.rglob(f"*.{self.psg_extension}"))
+            and (content / "recipe").is_dir()
+        )
 
     def _build_ui(self):
         shell = QWidget()
@@ -2210,7 +2644,7 @@ class MainWindow(QMainWindow):
     def _load_models_tree(self):
         """Build the model categories directly from the cached cas_db folders."""
         self.model_tree.clear()
-        models_root = self.cache_dir / "data" / "content" / "createacharacter" / "model" / "cas_db"
+        models_root = self.content_root / "createacharacter" / "model" / "cas_db"
         if not models_root.is_dir():
             self.model_tree.addTopLevelItem(QTreeWidgetItem([
                 "No cached models found — unpack createacharacter.big first."
@@ -2302,26 +2736,88 @@ class MainWindow(QMainWindow):
         return added
 
     def _request_archive(self):
-        picker = ArchivePicker(self, self.platform)
+        if get_skipped_setup() or not get_game_folder(self.platform):
+            if not choose_game_folder(self, self.platform):
+                return
+            save_skipped_setup(False)
+            choose_pack_mode(self)
+            self._refresh_game_mode()
+            if self._cache_ready():
+                self._index_cache()
+                return
+            source = self._locate_game_source()
+            if source is not None:
+                self._extract_archive(source)
+                return
+        if self.drawing_from_game and not self.keep_unpacked:
+            # Packed mode browsing loose files in the game folder. Offer to
+            # switch to the cache-based loop: unpack a chosen archive into
+            # the cache after removing the loose folders.
+            answer = QMessageBox.question(
+                self,
+                APP_TITLE,
+                f"UTT found loose folders which the {self.psg_extension}'s are "
+                "already being drawn from. Choose your createacharacter.big to "
+                "replace these loose folders with the cache.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+            picker = ArchivePicker(self, self.platform, self.keep_unpacked)
+            if (
+                picker.exec() == QDialog.DialogCode.Accepted
+                and picker.selected_path
+            ):
+                self._remove_loose_game_folders()
+                self._refresh_game_mode()
+                self._extract_archive(picker.selected_path)
+            return
+        if self.drawing_from_game:
+            QMessageBox.information(
+                self,
+                APP_TITLE,
+                "You're already browsing loose files in your game folder. "
+                "Repack to pack them into createacharacter.big, or unpack "
+                "into the cache from here later.",
+            )
+            return
+        picker = ArchivePicker(self, self.platform, self.keep_unpacked)
         if picker.exec() == QDialog.DialogCode.Accepted and picker.selected_path:
             self._extract_archive(picker.selected_path)
         else:
             save_skipped_archive()
 
     def _request_repack(self):
-        data_path = self.cache_dir / "data"
+        if self.drawing_from_game:
+            if not self.game_folder:
+                self._show_error("Set your game location in Settings before repacking.")
+                return
+            data_path = self.cache_dir
+            repack_dir = game_root(self.game_folder, self.platform)
+            data_rel_path = (
+                "USRDIR/data/content" if self.platform == "ps3" else "data/content"
+            )
+            subdirs = ("createacharacter", "recipe")
+            source_label = "createacharacter + recipe"
+        else:
+            data_path = self.cache_dir / "data"
+            repack_dir = self.cache_dir
+            data_rel_path = "data"
+            subdirs = None
+            source_label = "cache\\data"
         if not data_path.is_dir():
             self._show_error("Extract createacharacter.big before repacking it.")
             return
 
+        self._protect_original_big()
         target_path = data_path / "createacharacter.big"
         message = (
-            "Repack every file under cache\\data into:\n\n"
+            f"Repack every file under {source_label} into:\n\n"
             f"{target_path}\n\n"
             "Files are packed without compression for speed."
         )
         if target_path.exists():
-            message += "\n\nThe existing repacked archive will be replaced."
+            message += "\n\nAn existing archive at that location will be replaced."
         answer = QMessageBox.question(
             self,
             "Repack createacharacter.big?",
@@ -2334,7 +2830,7 @@ class MainWindow(QMainWindow):
         self.repack_button.setEnabled(False)
         self.archive_status.setText("Repacking createacharacter.big…")
         self.repack_progress = QProgressDialog(
-            "Packing cache\\data, please wait…", None, 0, 0, self
+            f"Packing {source_label}, please wait…", None, 0, 0, self
         )
         self.repack_progress.setWindowTitle(APP_TITLE)
         self.repack_progress.setWindowModality(
@@ -2344,17 +2840,61 @@ class MainWindow(QMainWindow):
         self.repack_progress.setMinimumDuration(0)
         self.repack_progress.setAutoClose(False)
         self.repack_progress.show()
-        self._start_worker(
-            lambda: self.archive_manager.repack(self.cache_dir),
-            self._repack_finished,
-            self._repack_failed,
-        )
+        def task():
+            result = self.archive_manager.repack(
+                repack_dir, data_rel_path=data_rel_path, subdirs=subdirs
+            )
+            if self.drawing_from_game:
+                self._remove_loose_game_folders()
+            return result
+        self._start_worker(task, self._repack_finished, self._repack_failed)
+
+    def _protect_original_big(self):
+        """Before repacking, move an original-sized .big in game/data/content
+        into the Backup folder so it can never be overwritten."""
+        if not self.game_folder:
+            return
+        content = content_dir(self.game_folder, self.platform)
+        dest = content / "createacharacter.big"
+        if dest.is_file() and is_original_big(dest, self.platform):
+            backup_dir = content / "Backup"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            os.replace(dest, backup_dir / "createacharacter.big")
+
+    def _place_archive_in_game(self, repacked_path: Path) -> Path:
+        """Move a freshly repacked archive into game/data/content."""
+        content = content_dir(self.game_folder, self.platform)
+        content.mkdir(parents=True, exist_ok=True)
+        dest = content / "createacharacter.big"
+        if dest.exists():
+            dest.unlink()
+        shutil.move(str(repacked_path), str(dest))
+        return dest
+
+    def _remove_loose_game_folders(self):
+        """Remove the loose createacharacter + recipe folders from the game
+        folder's data/content. Used after packing them into an archive and
+        when replacing loose files with the cache. The original archive stays
+        safe in Backup."""
+        if not self.game_folder:
+            return
+        content = content_dir(self.game_folder, self.platform)
+        for folder in ("createacharacter", "recipe"):
+            target = content / folder
+            if target.is_dir():
+                shutil.rmtree(target, ignore_errors=True)
 
     def _repack_finished(self, result):
         if self.repack_progress:
             self.repack_progress.close()
             self.repack_progress = None
         self.repack_button.setEnabled(True)
+        final_path = result.path
+        if self.drawing_from_game:
+            self._refresh_game_mode()
+            self._index_cache()
+        elif not self.keep_unpacked and self.game_folder:
+            final_path = self._place_archive_in_game(result.path)
         size_mb = result.size / (1024 * 1024)
         self.archive_status.setText(
             f"Repacked {result.file_count:,} files — {size_mb:,.1f} MB"
@@ -2362,7 +2902,7 @@ class MainWindow(QMainWindow):
         QMessageBox.information(
             self,
             APP_TITLE,
-            f"createacharacter.big created:\n{result.path}\n\n"
+            f"createacharacter.big created:\n{final_path}\n\n"
             f"{result.file_count:,} files • {size_mb:,.1f} MB",
         )
 
@@ -2376,17 +2916,135 @@ class MainWindow(QMainWindow):
 
     def _restore_cache_or_request_archive(self):
         """Use the persistent cache beside the EXE whenever it is available."""
-        if self.cache_dir.is_dir() and any(
-            self.cache_dir.rglob(f"*.{self.psg_extension}")
-        ):
+        if self._cache_ready():
             self.archive_status.setText("Loading existing texture cache…")
             self._start_worker(self._build_psg_index, self._archive_loaded)
-        elif get_skipped_archive():
+        elif get_skipped_archive() or get_skipped_setup():
             pass
         else:
-            self._request_archive()
+            source = self._locate_game_source()
+            if source is not None:
+                self._extract_archive(source)
+            else:
+                self._request_archive()
+
+    def _cache_ready(self) -> bool:
+        """True when UTT already has game files to browse.
+
+        Unpacked Xbox mode additionally needs the recipe folder the game
+        reads, so it is only considered ready when both are present.
+        """
+        if not self.cache_dir.is_dir():
+            return False
+        if self.keep_unpacked:
+            return any(self.cache_dir.rglob(f"*.{self.psg_extension}")) and (
+                self.cache_dir / "recipe"
+            ).is_dir()
+        return any(self.cache_dir.rglob(f"*.{self.psg_extension}"))
+
+    def _locate_game_source(self) -> Path | None:
+        """Find the archive to unpack in the saved game folder (loose or backup).
+
+        Returns None when nothing is found, so the archive picker can ask the
+        user to select createacharacter.big manually.
+        """
+        game_folder = get_game_folder(self.platform)
+        if not game_folder:
+            return None
+        source = locate_or_backup_source(game_folder, self.platform)
+        if source is not None:
+            self.archive_status.setText(f"Found createacharacter.big: {source}")
+        return source
+
+    def _clean_ps3_install_folders(self):
+        """Silently remove the contents of the PS3 INSTALL folders on launch.
+
+        Only runs for PS3 (and only when an RPCS3 root is saved), so the
+        installed copy under dev_hdd0/game/<serial>_INSTALL never shadows the
+        loose files UTT manages in PS3_GAME/USRDIR/data/content. dev_hdd0 is
+        a fixed RPCS3 path, so both serials are checked unconditionally.
+        """
+        if self.platform != "ps3":
+            return
+        rpcs3_root = get_rpcs3_folder(self.platform)
+        if not rpcs3_root:
+            return
+        try:
+            clean_ps3_install_folders(rpcs3_root)
+        except OSError:
+            pass
+
+    def _refresh_game_mode(self):
+        """Recompute mode-dependent paths after the setup gates are re-run."""
+        self.keep_unpacked = get_keep_files_packed() is False
+        self.game_folder = (
+            Path(get_game_folder(self.platform))
+            if get_game_folder(self.platform)
+            else None
+        )
+        self.drawing_from_game = (
+            self.game_folder is not None
+            and self._has_loose_content(content_dir(self.game_folder, self.platform))
+        )
+        self.cache_dir = self._resolve_cache_dir()
+        self.content_root = self._resolve_content_root()
+
+    def _loose_repack_big(self) -> Path | None:
+        """A non-original .big sitting loose in game/data/content (a repack)."""
+        if not self.game_folder:
+            return None
+        loose = content_dir(self.game_folder, self.platform) / "createacharacter.big"
+        if loose.is_file() and not is_original_big(loose, self.platform):
+            return loose
+        return None
+
+    def _maybe_confirm_repack_unpack(self, archive: Path) -> bool:
+        """Ask before unpacking a repacked .big that sits loose in the game folder.
+
+        The untouched original is never prompted for — the size guard keeps it
+        safe in Backup. Returns True to proceed with the unpack.
+        """
+        loose_repack = self._loose_repack_big()
+        if loose_repack is None or get_always_unpack():
+            return True
+        if self.keep_unpacked:
+            action = (
+                "Unpack it into loose files so you can edit textures and "
+                "models? The packed archive is removed once unpacked (you "
+                "can always repack it again)."
+            )
+        else:
+            action = (
+                "Unpack it to the cache so you can edit textures and models? "
+                "The packed archive stays in place — you edit in the cache "
+                "and repack when you're ready."
+            )
+        box = QMessageBox(
+            QMessageBox.Icon.Question,
+            APP_TITLE,
+            "A createacharacter.big is packed in your game folder.\n\n"
+            f"{loose_repack}\n\n{action}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            self,
+        )
+        always = QCheckBox("Always unpack without asking", box)
+        box.setCheckBox(always)
+        if box.exec() != QMessageBox.StandardButton.Yes:
+            self._index_cache()
+            self.archive_status.setText(
+                "Packed archive left in place — click Choose archive to unpack it later"
+            )
+            return False
+        if always.isChecked():
+            save_always_unpack(True)
+        return True
 
     def _extract_archive(self, archive: Path):
+        if self.keep_unpacked:
+            self._extract_archive_unpacked(archive)
+            return
+        if not self._maybe_confirm_repack_unpack(archive):
+            return
         if self.cache_dir.is_dir() and any(
             path.is_file() for path in self.cache_dir.rglob("*")
         ):
@@ -2420,6 +3078,41 @@ class MainWindow(QMainWindow):
             return self._build_psg_index()
         self._start_worker(extract, self._archive_loaded)
 
+    def _extract_archive_unpacked(self, archive: Path):
+        """Unpack createacharacter + recipe straight into the game folder.
+
+        Only the two subtrees the game reads are copied out, and existing
+        loose files are never overwritten. When the archive is a repacked
+        .big sitting loose in game/data/content, ask first (with an "always
+        unpack" remember option) and delete it once unpacked — the loose
+        folders now hold the same content, and the game would otherwise
+        prefer the .big over them.
+        """
+        loose_repack = self._loose_repack_big()
+        if not self._maybe_confirm_repack_unpack(archive):
+            return
+        self.archive_status.setText("Unpacking into game folder…")
+        self.repack_button.setEnabled(False)
+        self.unpack_progress = QProgressDialog(
+            "Unpacking createacharacter.big into your game folder…", None, 0, 0, self
+        )
+        self.unpack_progress.setWindowTitle(APP_TITLE)
+        self.unpack_progress.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.unpack_progress.setCancelButton(None)
+        self.unpack_progress.setMinimumDuration(0)
+        self.unpack_progress.setAutoClose(False)
+        self.unpack_progress.show()
+
+        def extract():
+            unpack_into_game(
+                self.assets_dir / "bigfile.exe", archive, self.game_folder,
+                self.platform,
+            )
+            if loose_repack is not None:
+                loose_repack.unlink(missing_ok=True)
+            return self._build_psg_index()
+        self._start_worker(extract, self._archive_loaded)
+
     def _build_psg_index(self) -> dict[str, list[Path]]:
         index: dict[str, list[Path]] = {}
         for file in self.cache_dir.rglob(f"*.{self.psg_extension}"):
@@ -2436,6 +3129,7 @@ class MainWindow(QMainWindow):
 
     def _archive_loaded(self, index):
         self.psg_index = index
+        self._refresh_game_mode()
         self._refresh_browser_tree()
         self.archive_status.setText(
             f"Cache ready — {sum(map(len, index.values()))} "
@@ -3458,10 +4152,82 @@ class MainWindow(QMainWindow):
         note.setObjectName("convertDescription")
         general_layout.addWidget(note)
 
-        separator = QFrame()
-        separator.setFrameShape(QFrame.Shape.HLine)
-        separator.setStyleSheet("color: #3c4043;")
-        general_layout.addWidget(separator)
+        if self.platform in ("xbx", "ps3"):
+            pack_header = QLabel("Game files")
+            pack_header.setObjectName("dialogTitle")
+            general_layout.addWidget(pack_header)
+
+            game_row = QHBoxLayout()
+            game_row.setSpacing(12)
+            game_row.addWidget(
+                QLabel("RPCS3 location" if self.platform == "ps3" else "Game location")
+            )
+            settings_game_folder = get_game_folder(self.platform)
+            settings_rpcs3_folder = get_rpcs3_folder(self.platform)
+            self.game_folder_label = QLabel(settings_game_folder or "Not set")
+            self.game_folder_label.setWordWrap(True)
+            game_row.addWidget(self.game_folder_label, 1)
+            game_browse = QPushButton("Change…")
+
+            def _pick_game_folder():
+                nonlocal settings_game_folder, settings_rpcs3_folder
+                dialog_title = (
+                    "Select your RPCS3 folder"
+                    if self.platform == "ps3"
+                    else "Select your game location"
+                )
+                folder = QFileDialog.getExistingDirectory(
+                    self, dialog_title, settings_game_folder or ""
+                )
+                if folder:
+                    if self.platform == "ps3":
+                        settings_rpcs3_folder = folder
+                        folder = resolve_ps3_game_selection(self, folder)
+                    settings_game_folder = folder
+                    self.game_folder_label.setText(folder or "Not set")
+
+            game_browse.clicked.connect(_pick_game_folder)
+            game_row.addWidget(game_browse)
+            general_layout.addLayout(game_row)
+
+            pack_row = QHBoxLayout()
+            pack_row.setSpacing(12)
+            pack_row.addWidget(QLabel("How UTT keeps your game files"))
+            self.pack_mode_combo = AppComboBox()
+            self.pack_mode_combo.addItem("Keep files packed", True)
+            self.pack_mode_combo.addItem("Keep files unpacked", False)
+            saved_pack = get_keep_files_packed()
+            self.pack_mode_combo.setCurrentIndex(0 if saved_pack is not False else 1)
+            pack_row.addWidget(self.pack_mode_combo, 1)
+            general_layout.addLayout(pack_row)
+
+            if self.platform == "xbx":
+                pack_note_text = (
+                    "Keep files packed is best for Xbox consoles. Keep files "
+                    "unpacked is for the PC recomp and makes replacing "
+                    "textures and models easier."
+                )
+            else:
+                pack_note_text = (
+                    "Keep files packed is best for PS3. Keep files unpacked "
+                    "reads loose files directly and makes replacing textures "
+                    "and models easier."
+                )
+            pack_note = QLabel(pack_note_text)
+            pack_note.setWordWrap(True)
+            pack_note.setObjectName("convertDescription")
+            general_layout.addWidget(pack_note)
+
+            self.always_unpack_check = QCheckBox(
+                "Always unpack a packed archive without asking"
+            )
+            self.always_unpack_check.setChecked(get_always_unpack())
+            general_layout.addWidget(self.always_unpack_check)
+
+            separator = QFrame()
+            separator.setFrameShape(QFrame.Shape.HLine)
+            separator.setStyleSheet("color: #3c4043;")
+            general_layout.addWidget(separator)
 
         export_header = QLabel("glTF export")
         export_header.setObjectName("dialogTitle")
@@ -3650,6 +4416,22 @@ class MainWindow(QMainWindow):
             self.accent_soft = theme[self.platform]["soft"]
             self._apply_style()
             self.update()
+        if self.platform in ("xbx", "ps3"):
+            prev_mode = get_keep_files_packed()
+            prev_folder = get_game_folder(self.platform)
+            new_mode = bool(self.pack_mode_combo.currentData())
+            save_keep_files_packed(new_mode)
+            if settings_game_folder != prev_folder:
+                save_game_folder(settings_game_folder, self.platform)
+            if self.platform == "ps3" and settings_rpcs3_folder:
+                save_rpcs3_folder(settings_rpcs3_folder, self.platform)
+            save_always_unpack(self.always_unpack_check.isChecked())
+            if new_mode != prev_mode or settings_game_folder != prev_folder:
+                self._refresh_game_mode()
+                if self._cache_ready():
+                    self._start_worker(self._build_psg_index, self._archive_loaded)
+                else:
+                    self._index_cache()
         target = combo.currentData()
         if target == self.platform:
             return

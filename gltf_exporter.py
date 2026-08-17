@@ -467,9 +467,8 @@ def _build_gltf_dict(
     normals = np.concatenate(merged_norms, axis=0) if merged_norms else None
     uvs = np.concatenate(merged_uvs, axis=0) if merged_uvs else None
 
-    # Normalize to [-0.5, 0.5] so mesh is visible in Blender
-    # PSG stores vertices as int16; the parser casts raw (no scaling),
-    # making positions span ~65535 units. Noesis divides by ~32768.
+    # Normalize to [-0.5, 0.5] so the static mesh is visible in Blender
+    # regardless of the game's fixed-point vertex scale.
     center = (vertices.max(axis=0) + vertices.min(axis=0)) * 0.5
     vertices -= center
     span = float(np.max(np.ptp(vertices, axis=0)))

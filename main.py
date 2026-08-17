@@ -7,7 +7,13 @@ from PyQt6.QtCore import qInstallMessageHandler, qCritical, qWarning, qInfo, qDe
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 
-from mainui import MainWindow, choose_platform
+from mainui import (
+    MainWindow,
+    choose_platform,
+    choose_game_folder,
+    choose_pack_mode,
+    get_skipped_setup,
+)
 from mdl_parser import load_model
 
 FILE_SUFFIXES = (".rx2", ".psg")
@@ -84,6 +90,9 @@ def main() -> int:
     platform = choose_platform()
     if not platform:
         return 0
+    if not get_skipped_setup():
+        if choose_game_folder(platform=platform):
+            choose_pack_mode()
     window = MainWindow(model_loader=load_model, platform=platform)
     window.show()
     window._toggle_maximized()

@@ -21,7 +21,17 @@ class ArchiveManager:
         self,
         cache_dir: str | Path,
         compression: int = 0,
+        data_rel_path: str = "data",
+        subdirs: tuple[str, ...] | None = None,
     ) -> RepackResult:
+        """Pack files under ``cache_dir/<data_rel_path>`` into createacharacter.big.
+
+        Archive paths are stored relative to ``cache_dir``, so the packed
+        archive mirrors the game's loose layout (e.g. ``data/content/...``).
+        When ``subdirs`` is given, only files whose top-level folder under the
+        data path is in that set are packed (used for unpacked Xbox mode,
+        which repacks just createacharacter + recipe).
+        """
         if not self.bigfile_path.is_file():
             raise FileNotFoundError(
                 f"Required tool not found: {self.bigfile_path}. "
@@ -32,10 +42,10 @@ class ArchiveManager:
             raise ValueError("compression must be between 0 (none) and 4 (LZX)")
 
         cache_path = Path(cache_dir).resolve()
-        data_path = cache_path / "data"
+        data_path = (cache_path / data_rel_path).resolve() if data_rel_path else cache_path
         target_path = data_path / "createacharacter.big"
         if not data_path.is_dir():
-            raise FileNotFoundError(f"Cache data folder not found: {data_path}")
+            raise FileNotFoundError(f"Data folder not found: {data_path}")
 
         files = sorted(
             (
@@ -45,8 +55,14 @@ class ArchiveManager:
             ),
             key=lambda path: str(path).lower(),
         )
+        if subdirs:
+            files = [
+                path
+                for path in files
+                if path.relative_to(data_path).parts[0] in subdirs
+            ]
         if not files:
-            raise RuntimeError("The cache data folder does not contain any files to pack")
+            raise RuntimeError("The data folder does not contain any files to pack")
 
         response_path = cache_path / ".utt_repack_files.rsp"
         staging_path = data_path / "createacharacter.big.new"

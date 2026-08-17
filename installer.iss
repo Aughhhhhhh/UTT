@@ -1,5 +1,5 @@
 #define AppName "UTT"
-#define AppVersion "2.0.2"
+#define AppVersion "2.1.0"
 #define AppExeName "UTT.exe"
 
 [Setup]
