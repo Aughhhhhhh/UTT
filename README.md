@@ -37,7 +37,7 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
 
 ## Install
 
-Download `UTT-Setup-2.1.0.exe` from the
+Download `UTT-Setup-2.1.1.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -95,15 +95,14 @@ Collaborators with write access can publish installers without the GitHub CLI:
 2. Commit and push the source changes. GitHub Desktop can do this without a
    separate Git installation.
 3. Run `build_installer.bat`.
-4. Open the repository's **Releases** page and choose **Draft a new release**.
-5. Create a tag matching the version, such as `v2.1.0`, and attach
-   `build/installer/UTT-Setup-2.1.0.exe`.
+4. Open the repository's **Releases** page and choose **Draft a new release**.5. Create a tag matching the version, such as `v2.1.1`, and attach
+    `build/installer/UTT-Setup-2.1.1.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release
 asset when correcting the build for that exact version.
 
-## What's new in 2.1.0
+## What's new in 2.1.1
 
 - Xbox 360 and PS3 now work straight from your game folder: UTT locates
   `createacharacter.big` (or a loose copy), backs up the untouched original

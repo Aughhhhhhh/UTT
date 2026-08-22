@@ -1087,15 +1087,20 @@ def _box_downsample(rgba, w, h, w2, h2):
     return bytes(out)
 
 
-def encode_rx2_texture(template, width, height, rgba, min_mip=128):
+def encode_rx2_texture(template, width, height, rgba, min_mip=1, hash_name=None):
     """Build a complete RX2 file from an RGBA image (pure Python encoder).
 
     ``template`` is the byte content of a known-good RX2 container; its
     header and file table are reused verbatim and the payload is replaced
     with a freshly encoded DXT5 mip chain. ``rgba`` is ``width * height * 4``
     row-major RGBA bytes (apply any opacity to the alpha channel before
-    calling). Mips are generated down to ``min_mip`` (the X360 swizzle is
-    only exact at widths of 32 block units, i.e. 128px).
+    calling). Mips are generated down to ``min_mip`` and the chain is
+    padded to the X360 GPU's 64-KiB allocation granularity so the game
+    recognises the file.
+
+    If ``hash_name`` is given (e.g. ``"0x00000bbe03e38818"``), the 8-byte
+    hash at offset 0x19C and the ASCII texture-name string at offset 0x1AC
+    are patched so the game accepts the file as the correct texture.
 
     Returns the complete RX2 file as bytes.
     """
@@ -1131,11 +1136,27 @@ def encode_rx2_texture(template, width, height, rgba, min_mip=128):
 
     chain = b"".join(encode_dxt5(m, w, h) for (w, h, m) in mips)
 
+    # Pad the lower-mip region to the X360 GPU's 64 KiB allocation
+    # granularity.  The base mip occupies its natural tiled size; all
+    # remaining mips are concatenated and the region is rounded up to
+    # the next 64 KiB boundary (the smallest page the GPU manages for
+    # DXT5 textures).  Without this padding the total payload is too
+    # short for the game's memory layout and the texture shows as
+    # "missing" in-game.
+    base_bytes = ((width + 3) >> 2) * ((height + 3) >> 2) * 16
+    lower_bytes = len(chain) - base_bytes
+    if lower_bytes > 0:
+        lower_padded = ((lower_bytes + 65535) // 65536) * 65536
+        pad = lower_padded - lower_bytes
+        chain += b"\x00" * pad
+
     out = bytearray(template[:rx2.data_base])
     out += chain
     p = entry.info_offset
-    out[p + 28:p + 32] = struct.pack(">I", 64 * (len(mips) - 1))
-    out[p + 32:p + 36] = struct.pack(">I", 0xA00 + max(0x4000, width * width))
+    # Write only the fields that actually change; preserve the template's
+    # per-platform metadata (bytes 28-31 = dxt5_variant + flags, bytes
+    # 32-34 = unknown constant) that the game validates.  Overwriting
+    # those with computed values causes "missing texture" in-game.
     out[p + 35] = FMT_DXT5
     # Real game files store the dimensions as width:13 = w-1 in bytes 38-39
     # and height in bytes 36-37 as (h-1)>>3 (8 bits, so max 2048 tall);
@@ -1150,6 +1171,24 @@ def encode_rx2_texture(template, width, height, rgba, min_mip=128):
             ">I", ((height - 1) << 13) | (width - 1))
     f2_pos = rx2.file_table_offset + (entry.index - 1) * 24 + 8
     out[f2_pos:f2_pos + 4] = struct.pack(">I", len(chain))
+    # Patch the total-disposable-size field at offset 0x54 (graphics
+    # base-resource size).  Mesh RX2s patch this in rx2_glb_converter;
+    # texture-only RX2s inherited it verbatim from the template, which
+    # was stale whenever the new payload differed in size from the
+    # template's.  The game validates this field; a mismatched value
+    # causes "missing texture" in-game.
+    out[0x54:0x58] = struct.pack(">I", len(chain))
+    if hash_name:
+        # Remove optional leading '0x'
+        hn = hash_name[2:] if hash_name.lower().startswith('0x') else hash_name
+        raw_hash = bytes.fromhex(hn.ljust(16, '0')[:16])
+        # Patch the 8-byte hash at offset 0x19C
+        out[0x19C:0x1A4] = struct.pack(">Q", int.from_bytes(raw_hash, 'big'))
+        # Patch the ASCII hex string at 0x1AC (max 18 chars + null)
+        name_str = ('0x' + hn.rjust(14, '0')).encode('ascii')
+        name_str = name_str[:18] + b'\x00'
+        out[0x1AC:0x1AC + len(name_str)] = name_str
+        # Byte after the name null-terminator is preserved from template
     return bytes(out)
 
 

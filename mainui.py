@@ -51,7 +51,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 CREDITS_TEXT = (
     "Credits\n\n"
@@ -4044,7 +4044,8 @@ class MainWindow(QMainWindow):
                 image.putalpha(alpha)
             rgba = image.tobytes()
         data = encode_rx2_texture(container.read_bytes(),
-                                  resolution, resolution, rgba)
+                                  resolution, resolution, rgba,
+                                  hash_name=alias)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_bytes(data)
         return str(output_path)
