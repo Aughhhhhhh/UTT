@@ -1158,17 +1158,15 @@ def encode_rx2_texture(template, width, height, rgba, min_mip=1, hash_name=None)
     # 32-34 = unknown constant) that the game validates.  Overwriting
     # those with computed values causes "missing texture" in-game.
     out[p + 35] = FMT_DXT5
-    # Real game files store the dimensions as width:13 = w-1 in bytes 38-39
-    # and height in bytes 36-37 as (h-1)>>3 (8 bits, so max 2048 tall);
-    # the Noesis plugin reads exactly that. Exports taller than 2048 (PC
-    # recomp) use the extended layout instead: full 13-bit height at bits
-    # 13-25, which stock Xbox tooling misreads but recomp handles.
-    if height <= 2048:
-        out[p + 36:p + 40] = struct.pack(
-            ">I", (((height - 1) >> 3) << 16) | (width - 1))
-    else:
-        out[p + 36:p + 40] = struct.pack(
-            ">I", ((height - 1) << 13) | (width - 1))
+    # The 32-bit surface-size field holds width:13 = w-1 in bits 0-12 and
+    # height:13 = h-1 in bits 13-25.  Every real in-game RX2, rx2tool and
+    # genrx2 output encodes it this way (a 512x512 DXT5 surface is
+    # 0x003FE1FF).  Writing only (h-1)>>3 -- which is what the Noesis
+    # plugin reconstructs from byte 37 and what UTT used to emit -- leaves
+    # the low three height bits zero, so the game reads the surface as
+    # 505 rows tall instead of 512 and stretches/offsets the texture.
+    out[p + 36:p + 40] = struct.pack(
+        ">I", ((height - 1) << 13) | (width - 1))
     f2_pos = rx2.file_table_offset + (entry.index - 1) * 24 + 8
     out[f2_pos:f2_pos + 4] = struct.pack(">I", len(chain))
     # Patch the total-disposable-size field at offset 0x54 (graphics

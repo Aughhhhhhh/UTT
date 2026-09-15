@@ -51,7 +51,7 @@ from PSGTx import PSGTx
 
 
 APP_TITLE = "UTT — Ultimate Texture Toolkit"
-APP_VERSION = "2.1.1"
+APP_VERSION = "2.1.2"
 
 CREDITS_TEXT = (
     "Credits\n\n"

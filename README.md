@@ -37,7 +37,7 @@ UTT is a Windows desktop tool for browsing and modifying Skate 3
 
 ## Install
 
-Download `UTT-Setup-2.1.1.exe` from the
+Download `UTT-Setup-2.1.2.exe` from the
 [latest release](https://github.com/Aughhhhhhh/UTT/releases/latest).
 The installer defaults to `Documents/UTT`, and the destination can be changed.
 
@@ -95,12 +95,20 @@ Collaborators with write access can publish installers without the GitHub CLI:
 2. Commit and push the source changes. GitHub Desktop can do this without a
    separate Git installation.
 3. Run `build_installer.bat`.
-4. Open the repository's **Releases** page and choose **Draft a new release**.5. Create a tag matching the version, such as `v2.1.1`, and attach
-    `build/installer/UTT-Setup-2.1.1.exe`.
+4. Open the repository's **Releases** page and choose **Draft a new release**.5. Create a tag matching the version, such as `v2.1.2`, and attach
+    `build/installer/UTT-Setup-2.1.2.exe`.
 6. Set a release title, add notes, and choose **Publish release**.
 
 Use a new version and tag for normal changes. Only replace an existing release
 asset when correcting the build for that exact version.
+
+## What's new in 2.1.2
+
+- Fixed Xbox RX2 textures rendering stretched and offset in game. The encoder
+  wrote a shortened surface-size field (rounded to a multiple of eight rows),
+  so the game read a 512-tall texture as 505 rows and stretched the image. RX2
+  exports now write the full `width-1` / `height-1` field exactly like genuine
+  in-game files.
 
 ## What's new in 2.1.1
 
